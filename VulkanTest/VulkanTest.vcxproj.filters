@@ -19,4 +19,12 @@
       <Filter>源文件</Filter>
     </ClCompile>
   </ItemGroup>
+  <ItemGroup>
+    <None Include="shaders\shader.frag">
+      <Filter>源文件</Filter>
+    </None>
+    <None Include="shaders\shader.vert">
+      <Filter>源文件</Filter>
+    </None>
+  </ItemGroup>
 </Project>
