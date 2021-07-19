@@ -1494,3 +1494,461 @@ void createTextureImage() {
 
 `Stbi_load` 函数将文件路径和要加载的通道数作为参数。`STBI_rgb_alpha`值强制图像加载 alpha 通道，即使它没有alpha通道，这对将来与其他纹理的一致性非常好。中间的三个参数是图像中的宽度、高度和实际通道数的输出。返回的指针是像素值数组中的第一个元素。对于 `texWidth * texHeight * 4` 的总值，像素以每像素4字节的方式逐行排列，使用`STBI_rgb_alpha`。
 
+#### Staging buffer 分级缓冲区
+
+我们现在要在主机可见内存中创建一个缓冲区，这样我们就可以使用 `vkMapMemory` 并将像素复制到它。将这个临时缓冲区的变量添加到 `createTextureImage` 函数:
+
+```cpp
+VkBuffer stagingBuffer;
+VkDeviceMemory stagingBufferMemory;
+```
+
+缓冲区应该在主机可见内存中，这样我们可以映射它，它应该可以作为一个传输源，这样我们可以在之后将它复制到一个映像上:
+
+```cpp
+createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+```
+
+然后我们可以直接将从图像加载库获得的像素值复制到缓冲区:
+
+```cpp
+void* data;
+vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+    memcpy(data, pixels, static_cast<size_t>(imageSize));
+vkUnmapMemory(device, stagingBufferMemory);
+```
+
+现在不要忘记清理原始的像素数组:
+
+```cpp
+stbi_image_free(pixels);
+```
+
+#### Texture Image 纹理图像
+
+虽然我们可以设置着色器来访问缓冲区中的像素值，但是最好使用 Vulkan 中的图像对象来实现这个目的。图像对象将使检索颜色更容易和更快，因为我们可以使用二维坐标。图像对象中的像素被称为 texels，我们将从这一点开始使用这个名称。添加以下新类成员:
+
+```cpp
+VkImage textureImage;
+VkDeviceMemory textureImageMemory;
+```
+
+图像的参数是在 `VkImageCreateInfo` 结构中指定的:
+
+```cpp
+VkImageCreateInfo imageInfo{};
+imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+imageInfo.imageType = VK_IMAGE_TYPE_2D;
+imageInfo.extent.width = static_cast<uint32_t>(texWidth);
+imageInfo.extent.height = static_cast<uint32_t>(texHeight);
+imageInfo.extent.depth = 1;
+imageInfo.mipLevels = 1;
+imageInfo.arrayLayers = 1;
+```
+
+在 `imageType` 字段中指定的图像类型，告诉 Vulkan 图像中的文本将被寻址到何种坐标系。创建一维、二维和三维图像是可能的。一维图像可用于存储数据数组或梯度，二维图像主要用于纹理，三维图像可用于存储体素体积，例如。`extent` 字段指定图像的尺寸，基本上就是每个轴上有多少个 texels 。这就是为什么 `depth` 必须是`1`而不是`0`。我们的纹理将不是一个数组，同时我们现在不会使用 mipmapping。
+
+```cpp
+imageInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+```
+
+Vulkan 支持许多可能的图像格式，但是我们应该对 texels 使用与缓冲区中的像素相同的格式，否则复制操作将失败。
+
+```cpp
+imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+```
+
+`tiling` 字段可以有以下两个值之一:
+
+- `VK_IMAGE_TILING_LINEAR` 像我们的像素数组一样，texel是按行顺序排列的
+- `VK_IMAGE_TILING_OPTIMAL` texel按照实现定义的最佳访问顺序排列
+
+与图像的布局不同，平铺模式不能在以后更改。如果你想直接访问图像内存中的文本，那么你必须使用 `VK_IMAGE_TILING_LINEAR`。我们将使用临时缓冲区而不是临时映像，因此不需要这样做。我们将使用 `VK_IMAGE_TILING_OPTIMAL` 从着色器进行高效访问。
+
+```cpp
+imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+```
+
+一个图片的 `initialLayout` 只有两个可能的值:
+
+- `VK_IMAGE_LAYOUT_UNDEFINED` 无法被GPU使用且第一个变换将丢弃texel
+- `VK_IMAGE_LAYOUT_PREINITIALIZED` 无法被GPU使用但是第一个变换将保留texel
+
+在很少的情况下，需要在第一次转换时保留texel。然而，一个例子是，如果您想结合`VK_IMAGE_TILING_LINEAR`布局使用一个图像作为分段图像。在这种情况下，您需要上传texel数据到它，然后将图像转换为传输源而不丢失数据。然而，在我们的例子中，我们首先要将图像转换为传输目的地，然后将texel数据从缓冲区对象复制到它，所以我们不需要这个属性，可以安全地使用`VK_IMAGE_LAYOUT_UNDEFINED`。
+
+```cpp
+imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+```
+
+`usage` 字段具有与创建缓冲区时相同的语义。映像将用作缓冲区副本的目的地，因此应该将其设置为传输目的地。我们还希望能够从着色器访问图像来为我们的网格着色，所以使用应该包括 `VK_IMAGE_USAGE_SAMPLED_BIT`。
+
+```cpp
+imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+```
+
+映像将只被一个队列族使用:支持图形传输操作(因此也支持)的队列族。
+
+`samples` 标志与重采样有关。这只适用于将作为附件使用的图像，所以坚持使用一次采样。对于与稀疏图像相关的图像，有一些可选的标志。稀疏图像是指只有特定区域使用内存存储的图像。例如，如果对体素地形使用3D 纹理，那么可以使用它来避免分配内存来存储大量的“空气”值。我们不会在本教程中使用它，所以让它保持默认值0。
+
+```cpp
+if (vkCreateImage(device, &imageInfo, nullptr, &textureImage) != VK_SUCCESS) {
+    throw std::runtime_error("failed to create image!");
+}
+```
+
+图片是使用 `vkCreateImage` 创建的，没有任何特别值得注意的参数。图形硬件有可能不支持 `VK_FORMAT_R8G8B8A8_SRGB`  格式。你您应该有一个可接受的替代方案列表，并选择受支持的最佳方案。但是，对这种特殊格式的支持非常普遍，我们将跳过这一步。使用不同的格式也需要烦人的转换。我们将在深度缓冲区一章回到这个问题，在那里我们将实现这样一个系统。
+
+```cpp
+VkMemoryRequirements memRequirements;
+vkGetImageMemoryRequirements(device, textureImage, &memRequirements);
+
+VkMemoryAllocateInfo allocInfo{};
+allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+allocInfo.allocationSize = memRequirements.size;
+allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+if (vkAllocateMemory(device, &allocInfo, nullptr, &textureImageMemory) != VK_SUCCESS) {
+    throw std::runtime_error("failed to allocate image memory!");
+}
+
+vkBindImageMemory(device, textureImage, textureImageMemory, 0);
+```
+
+为映像分配内存的工作方式与为缓冲区分配内存完全相同。除了使用 `vkGetImageMemoryRequirements` 而不是 `vkGetBufferMemoryRequirements` ，并使用 `vkBindImageMemory` 而不是 `vkBindBufferMemory` 。
+
+这个函数已经变得相当大了，在后面的章节中需要创建更多的图像，所以我们应该将图像创建抽象到 createImage 函数中，就像我们对缓冲区所做的那样。创建函数并将图像对象的创建和内存分配移动到它:
+
+```cpp
+void createImage(uint32_t width, uint32_t height, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+    VkImageCreateInfo imageInfo{};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.extent.width = width;
+    imageInfo.extent.height = height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.format = format;
+    imageInfo.tiling = tiling;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    imageInfo.usage = usage;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    if (vkCreateImage(device, &imageInfo, nullptr, &image) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create image!");
+    }
+
+    VkMemoryRequirements memRequirements;
+    vkGetImageMemoryRequirements(device, image, &memRequirements);
+
+    VkMemoryAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocInfo.allocationSize = memRequirements.size;
+    allocInfo.memoryTypeIndex = findMemoryType(memRequirements.memoryTypeBits, properties);
+
+    if (vkAllocateMemory(device, &allocInfo, nullptr, &imageMemory) != VK_SUCCESS) {
+        throw std::runtime_error("failed to allocate image memory!");
+    }
+
+    vkBindImageMemory(device, image, imageMemory, 0);
+}
+```
+
+我已经设置了宽度、高度、格式、平铺模式、使用和内存属性参数，因为这些参数在整个教程中我们将创建的图像之间都会有所不同。
+
+现在 `createTextureImage` 函数可以简化为:
+
+```cpp
+void createTextureImage() {
+    int texWidth, texHeight, texChannels;
+    stbi_uc* pixels = stbi_load("textures/texture.jpg", &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+    VkDeviceSize imageSize = texWidth * texHeight * 4;
+
+    if (!pixels) {
+        throw std::runtime_error("failed to load texture image!");
+    }
+
+    VkBuffer stagingBuffer;
+    VkDeviceMemory stagingBufferMemory;
+    createBuffer(imageSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stagingBuffer, stagingBufferMemory);
+
+    void* data;
+    vkMapMemory(device, stagingBufferMemory, 0, imageSize, 0, &data);
+        memcpy(data, pixels, static_cast<size_t>(imageSize));
+    vkUnmapMemory(device, stagingBufferMemory);
+
+    stbi_image_free(pixels);
+
+    createImage(texWidth, texHeight, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+}
+```
+
+#### Layout transitions 布局转换
+
+我们现在要写的函数涉及到记录和执行一个命令缓冲区，所以现在是时候把这个逻辑转移到一个或两个辅助函数中:
+
+```cpp
+VkCommandBuffer beginSingleTimeCommands() {
+    VkCommandBufferAllocateInfo allocInfo{};
+    allocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    allocInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocInfo.commandPool = commandPool;
+    allocInfo.commandBufferCount = 1;
+
+    VkCommandBuffer commandBuffer;
+    vkAllocateCommandBuffers(device, &allocInfo, &commandBuffer);
+
+    VkCommandBufferBeginInfo beginInfo{};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+
+    vkBeginCommandBuffer(commandBuffer, &beginInfo);
+
+    return commandBuffer;
+}
+
+void endSingleTimeCommands(VkCommandBuffer commandBuffer) {
+    vkEndCommandBuffer(commandBuffer);
+
+    VkSubmitInfo submitInfo{};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+
+    vkQueueSubmit(graphicsQueue, 1, &submitInfo, VK_NULL_HANDLE);
+    vkQueueWaitIdle(graphicsQueue);
+
+    vkFreeCommandBuffers(device, commandPool, 1, &commandBuffer);
+}
+```
+
+这些函数的代码基于 `copyBuffer` 中的现有代码，现在可以将该函数简化为:
+
+```cpp
+void copyBuffer(VkBuffer srcBuffer, VkBuffer dstBuffer, VkDeviceSize size) {
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkBufferCopy copyRegion{};
+    copyRegion.size = size;
+    vkCmdCopyBuffer(commandBuffer, srcBuffer, dstBuffer, 1, &copyRegion);
+
+    endSingleTimeCommands(commandBuffer);
+}
+```
+
+如果我们仍然使用缓冲区，那么我们现在可以编写一个函数来记录并执行 `vkCmdCopyBufferToImage` 来完成工作，但是这个命令要求图像首先处于正确的布局中。创建一个新函数来处理布局转换:
+
+```cpp
+void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout) {
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    endSingleTimeCommands(commandBuffer);
+}
+```
+
+执行布局转换最常见的方法之一是使用图像存储屏障。这样的管道屏障通常用于同步对资源的访问，比如确保对缓冲区的写入在从缓冲区读取之前完成，但当使用`VK_SHARING_MODE_EXCLUSIVE`时，它也可以用于转换图像布局和传输队列族所有权。有一个等效的缓冲区内存屏障来为缓冲区实现这一点。
+
+```cpp
+VkImageMemoryBarrier barrier{};
+barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+barrier.oldLayout = oldLayout;
+barrier.newLayout = newLayout;
+```
+
+前两个字段指定布局转换。如果不关心图像的现有内容，可以使用`VK_IMAGE_LAYOUT_UNDEFINED`作为`oldLayout`。
+
+```cpp
+barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+```
+
+如果您正在使用屏障转移队列族所有权，那么这两个字段应该是队列族的索引。如果您不想这样做，它们必须被设置为`VK_QUEUE_FAMILY_IGNORED`(不是默认值!)。
+
+```cpp
+barrier.image = image;
+barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+barrier.subresourceRange.baseMipLevel = 0;
+barrier.subresourceRange.levelCount = 1;
+barrier.subresourceRange.baseArrayLayer = 0;
+barrier.subresourceRange.layerCount = 1;
+```
+
+`image`和`subresourceRange`指定受影响的映像和映像的特定部分。我们的图像不是数组，也没有mipmapping级别，所以只指定了一个级别和层。
+
+```cpp
+barrier.srcAccessMask = 0; // TODO
+barrier.dstAccessMask = 0; // TODO
+```
+
+`barrier`主要用于同步目的，因此您必须指定涉及资源的哪些操作必须在`barrier`之前发生，涉及资源的哪些操作必须在`barrier`上等待。尽管已经使用`vkQueueWaitIdle`来手动同步，但我们仍然需要这样做。正确的值取决于新旧布局，所以一旦我们确定了要使用哪个过渡，我们就会回到这个问题上。
+
+```cpp
+vkCmdPipelineBarrier(
+    commandBuffer,
+    0 /* TODO */, 0 /* TODO */,
+    0,
+    0, nullptr,
+    0, nullptr,
+    1, &barrier
+);
+```
+
+所有类型的管道屏障都使用相同的函数提交。命令缓冲区之后的第一个参数指定了应该在屏障之前发生的操作在哪个管道阶段发生。第二个参数指定管道阶段，操作将在该阶段中等待屏障。允许您在屏障之前和之后指定的管道阶段取决于您如何在屏障之前和之后使用资源。允许的值列在此规格表中。例如，如果你打算在`barrier`之后从`uniform`读取，你应该指定使用`VK_ACCESS_UNIFORM_READ_BIT`和将从`uniform`读取的最早的着色器作为管道阶段，例如`VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT`。为这种类型的使用指定一个非着色器管道阶段是没有意义的，当你指定一个管道阶段不匹配的使用类型时，验证层会警告你。
+
+第三个参数为`0`或`VK_DEPENDENCY_BY_REGION_BIT`。后者将障碍变成了每个区域的条件。例如，这意味着该实现允许已经开始读取到目前为止所写入的资源部分。
+
+最后三对参数代表了三种可用类型的管道屏障数组: 内存屏障、缓冲内存屏障和我们正在使用的图像内存屏障。请注意，我们还没有使用 `VkFormat` 参数，但是我们将在深度缓冲区一章中使用该参数进行特殊转换。
+
+#### Copying buffer to image 将缓冲区复制到图像
+
+在回到`createTextureImage`之前，我们要再写一个辅助函数:`copyBufferToImage`:
+
+```cpp
+void copyBufferToImage(VkBuffer buffer, VkImage image, uint32_t width, uint32_t height) {
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    endSingleTimeCommands(commandBuffer);
+}
+```
+
+就像缓冲区复制一样，您需要指定缓冲区的哪一部分将被复制到图像的哪一部分。这是通过`VkBufferImageCopy`结构发生的:
+
+```cpp
+VkBufferImageCopy region{};
+region.bufferOffset = 0;
+region.bufferRowLength = 0;
+region.bufferImageHeight = 0;
+
+region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+region.imageSubresource.mipLevel = 0;
+region.imageSubresource.baseArrayLayer = 0;
+region.imageSubresource.layerCount = 1;
+
+region.imageOffset = {0, 0, 0};
+region.imageExtent = {
+    width,
+    height,
+    1
+};
+```
+
+这些字段中的大多数都是不言自明的。`bufferOffset`指定像素值在缓冲区中开始的字节偏移量。`bufferRowLength`和`bufferImageHeight`字段指定了像素在内存中的布局方式。例如，在图像的行之间可以有一些填充字节。为两者指定0表示像素只是像在我们的例子中那样紧密地压缩。`imageSubresource`、`imageOffset`和`imageExtent`字段指出了我们想要复制的像素的图像的哪一部分。
+
+使用vkCmdCopyBufferToImage函数执行将从缓冲区复制到图像操作:
+
+```cpp
+vkCmdCopyBufferToImage(
+    commandBuffer,
+    buffer,
+    image,
+    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    1,
+    &region
+);
+```
+
+第四个参数表示图像当前使用的布局。我在这里假设图像已经过渡到最适合复制像素的布局。现在我们只将一块像素复制到整个图像中，但是可以指定`VkBufferImageCopy`数组来在一个操作中从这个缓冲区到图像执行许多不同的复制。
+
+#### Preparing the texture image 准备纹理图像
+
+现在我们已经有了设置纹理图像所需的所有工具，因此我们将回到 `createTextureImage` 函数。我们在这里做的最后一件事是创建纹理图像。下一步是将 staging buffer 复制到纹理图像。这包括两个步骤:
+
+- 将纹理图像转换为 `VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`
+- 执行缓冲区到图像复制操作
+
+可以很轻松的使用我们之前创建的函数来实现
+
+```cpp
+transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+```
+
+这个图像是用`VK_IMAGE_LAYOUT_UNDEFINED`布局创建的，所以在转换为`textureImage`时应该指定旧的布局。请记住，我们可以这样做，因为在执行复制操作之前，我们并不关心它的内容。
+
+为了能够从着色器中的纹理图像开始采样，我们需要最后一个转换来为着色器访问做准备:
+
+```cpp
+transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+```
+
+#### Transition barrier masks 转换屏障遮罩
+
+如果你现在运行应用程序时启用了验证层，那么你会看到它报告`transitionImageLayout`中的访问遮罩和管道阶段无效。我们仍然需要根据过渡中的布局来设置这些。
+
+我们需要处理两个过渡:
+
+- 未定义→传输目的地:传输不需要等待任何东西的写入
+- 传输目的地→着色器读取:着色器读取应该等待传输写入，特别是着色器读取片段着色器，因为那是我们将要使用纹理的地方
+
+这些规则是使用以下访问遮罩和管道阶段指定的:
+
+```cpp
+// transitionImageLayout
+VkPipelineStageFlags sourceStage;
+VkPipelineStageFlags destinationStage;
+
+if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+} else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+} else {
+    throw std::invalid_argument("unsupported layout transition!");
+}
+
+vkCmdPipelineBarrier(
+    commandBuffer,
+    sourceStage, destinationStage,
+    0,
+    0, nullptr,
+    0, nullptr,
+    1, &barrier
+);
+```
+
+正如您在前面的代码中所看到的，传输写必须发生在管道传输阶段。因为写操作不需要等待任何东西，所以可以为barrier之前的操作指定一个空的访问掩码和可能最早的管道阶段`VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT`。需要注意的是，`VK_PIPELINE_STAGE_TRANSFER_BIT`并不是图形和计算管道中的一个真正的阶段。这更像是一个转移发生的伪阶段。有关伪阶段的更多信息和其他示例，请参阅[文档](https://www.khronos.org/registry/vulkan/specs/1.1-extensions/man/html/VkPipelineStageFlagBits.html)。
+
+图像将在相同的管道阶段写入，然后由片段着色器读取，这就是为什么我们在片段着色器管道阶段指定着色器读取访问。
+
+如果我们将来需要做更多的转换，那么我们将扩展这个函数。应用程序现在应该可以成功运行了，尽管当然还没有视觉上的改变。
+
+需要注意的一点是，命令缓冲区提交在开始时会导致隐式的`VK_ACCESS_HOST_WRITE_BIT`同步。因为`transitionImageLayout`函数只使用一个命令执行一个命令缓冲区，所以如果您在布局转换中需要`VK_ACCESS_HOST_WRITE_BIT`依赖，您可以使用这个隐式同步并将`srcAccessMask`设置为0。这取决于你是否想要明确它，但我个人并不喜欢依赖这些类似opengl的“隐藏”操作。
+
+实际上，有一种特殊类型的图像布局支持所有操作，即`VK_IMAGE_LAYOUT_GENERAL`。当然，它的问题是，它不一定为任何操作提供最佳性能。在一些特殊情况下需要它，比如使用图像作为输入和输出，或者在图像离开预初始化布局后读取图像。
+
+到目前为止，所有提交命令的助手函数都设置为通过等待队列空闲来同步执行。对于实际应用程序，建议将这些操作组合在一个命令缓冲区中，并异步执行它们，以获得更高的吞吐量，特别是`createTextureImage`函数中的转换和复制。通过创建帮助函数记录命令的`setupCommandBuffer`，并添加一个`flushSetupCommands`来执行迄今为止已经记录的命令，尝试进行这方面的实验。最好是在纹理映射工作之后，检查纹理资源是否仍然设置正确。
+
+#### Cleanup  清理
+
+完成 createTextureImage 函数，在结束时清理 staging 缓冲区及其内存:
+
+```cpp
+    transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+    vkDestroyBuffer(device, stagingBuffer, nullptr);
+    vkFreeMemory(device, stagingBufferMemory, nullptr);
+}
+```
+
+使用主纹理图像直到程序结束:
+
+```cpp
+void cleanup() {
+    cleanupSwapChain();
+
+    vkDestroyImage(device, textureImage, nullptr);
+    vkFreeMemory(device, textureImageMemory, nullptr);
+
+    ...
+}
+```
+
+图像现在包含了纹理，但我们仍然需要一种方式来从图形管道访问它。我们将在下一章讨论。
