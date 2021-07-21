@@ -1952,3 +1952,295 @@ void cleanup() {
 ```
 
 图像现在包含了纹理，但我们仍然需要一种方式来从图形管道访问它。我们将在下一章讨论。
+
+### Image view and sampler 图像视图和取样器
+
+在本章中，我们将创建两个更多的资源，用于图形管道对图像进行采样。第一个资源是我们之前在处理交换链图像时已经见过的，但第二个是新的-它与着色器如何从图像中读取texel有关。
+
+#### Texture image view 纹理图像视图
+
+我们已经看到，使用交换链图像和framebuffer，图像是通过图像视图而不是直接访问的。我们还需要为纹理图像创建这样的图像视图。
+
+添加一个类成员来保存纹理图像的 `VkImageView` ，并创建一个新的函数 `createTextureImageView` ，我们将在其中创建它:
+
+```cpp
+VkImageView textureImageView;
+
+...
+
+void initVulkan() {
+    ...
+    createTextureImage();
+    createTextureImageView();
+    createVertexBuffer();
+    ...
+}
+
+...
+
+void createTextureImageView() {
+
+}
+```
+
+这个函数的代码可以直接基于`createImageViews`。你只需要改变`format`和`image`:
+
+```cpp
+VkImageViewCreateInfo viewInfo{};
+viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+viewInfo.image = textureImage;
+viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+viewInfo.format = VK_FORMAT_R8G8B8A8_SRGB;
+viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+viewInfo.subresourceRange.baseMipLevel = 0;
+viewInfo.subresourceRange.levelCount = 1;
+viewInfo.subresourceRange.baseArrayLayer = 0;
+viewInfo.subresourceRange.layerCount = 1;
+```
+
+我省略了显式的`viewInfo.components`初始化，因为`VK_COMPONENT_SWIZZLE_IDENTITY`被定义为0。通过调用`vkCreateImageView`完成图像视图的创建:
+
+```cpp
+if (vkCreateImageView(device, &viewInfo, nullptr, &textureImageView) != VK_SUCCESS) {
+    throw std::runtime_error("failed to create texture image view!");
+}
+```
+
+因为很多逻辑都是从 `createImageViews` 中复制出来的，所以你可能希望把它抽象成一个新的 `createImageView` 函数:
+
+```cpp
+VkImageView createImageView(VkImage image, VkFormat format) {
+    VkImageViewCreateInfo viewInfo{};
+    viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    viewInfo.image = image;
+    viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    viewInfo.format = format;
+    viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    viewInfo.subresourceRange.baseMipLevel = 0;
+    viewInfo.subresourceRange.levelCount = 1;
+    viewInfo.subresourceRange.baseArrayLayer = 0;
+    viewInfo.subresourceRange.layerCount = 1;
+
+    VkImageView imageView;
+    if (vkCreateImageView(device, &viewInfo, nullptr, &imageView) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create texture image view!");
+    }
+
+    return imageView;
+}
+```
+
+现在 `createTextureImageView` 函数可以简化为:
+
+```cpp
+void createTextureImageView() {
+    textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB);
+}
+```
+
+并且 `createImageViews` 可以简化为:
+
+```cpp
+void createImageViews() {
+    swapChainImageViews.resize(swapChainImages.size());
+
+    for (uint32_t i = 0; i < swapChainImages.size(); i++) {
+        swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat);
+    }
+}
+```
+
+确保在程序结束的时候销毁图像视图，就在销毁图像本身之前:
+
+```cpp
+void cleanup() {
+    cleanupSwapChain();
+
+    vkDestroyImageView(device, textureImageView, nullptr);
+
+    vkDestroyImage(device, textureImage, nullptr);
+    vkFreeMemory(device, textureImageMemory, nullptr);
+```
+
+#### Samplers 采样器
+
+着色器可以直接从图像中读取texel，但当它们被用作纹理时，这并不常见。纹理通常通过采样器访问，采样器将应用过滤和转换来计算最终检索到的颜色。
+
+这些滤波器有助于处理过采样等问题。考虑一个映射到具有更多片段而不是texel的几何图形的纹理。如果你简单地在每个片段中取纹理坐标中最近的texel，那么你会得到像第一张图片一样的结果:
+
+![texture_filtering](img/texture_filtering.png)
+
+如果你通过线性插值结合4个最接近的texel，那么你会得到一个像右边一样平滑的结果。当然，你的应用程序可能有更适合左风格的美术风格要求(如《我的世界》)，但在传统图形应用程序中，右风格是首选。当你从纹理中读取颜色时，采样器对象会自动为你应用这个过滤。
+
+采样不足是相反的问题，你有比片段更多的texel。这将导致在以尖角采样像棋盘纹理这样的高频模式时产生伪影:
+
+![anisotropic_filtering](img/anisotropic_filtering.png)
+
+如图所示，纹理在远处变得模糊混乱。解决这个问题的方法是[各向异性过滤](https://en.wikipedia.org/wiki/Anisotropic_filtering)，它也可以由采样器自动应用。
+
+除了这些过滤器之外，采样器还可以处理转换。它决定了当你试图通过它的寻址模式读取图像外的texel时会发生什么。下图展示了一些可能性:
+
+![texture_addressing](img/texture_addressing.png)
+
+我们现在将创建一个函数 `createTextureSampler` 来设置这样一个采样对象。稍后我们将使用这个取样器从着色器的纹理中读取颜色。
+
+```cpp
+void initVulkan() {
+    ...
+    createTextureImage();
+    createTextureImageView();
+    createTextureSampler();
+    ...
+}
+
+...
+
+void createTextureSampler() {
+
+}
+```
+
+采样器是通过 `VkSamplerCreateInfo` 结构配置的，该结构指定应该应用的所有过滤器和转换。
+
+```cpp
+VkSamplerCreateInfo samplerInfo{};
+samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+samplerInfo.magFilter = VK_FILTER_LINEAR;
+samplerInfo.minFilter = VK_FILTER_LINEAR;
+```
+
+`magFilter`和`minFilter`字段指定了如何插值放大或缩小的texel。放大涉及上面描述的过采样问题，缩小涉及向下采样问题。可选`VK_FILTER_NEAREST`和`VK_FILTER_LINEAR`，即最邻近与线性插值。
+
+```cpp
+samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+```
+
+可以使用`addressMode`字段为每个轴指定寻址模式。下面列出了可用的值。上面的图片展示了其中的大部分。注意轴被称为U, V和W，而不是X, Y和z。这是纹理空间坐标的约定。
+
+- `VK_SAMPLER_ADDRESS_MODE_REPEAT` 当超出图像尺寸时，重复纹理
+- `VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEA` 与repeat相似，但是当超出坐标范围的时候，会反转坐标来镜像图像
+- `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE` 图像坐标范围以外取最接近坐标的边缘的颜色。
+- `VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE` 与上相似，但使用相反的边缘代替最接近的边缘
+- `VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER` 当采样超过图像的尺寸时返回纯色
+
+我们在这里使用哪种寻址模式并不重要，因为在本教程中我们不会对图像以外的部分进行取样。然而，重复模式可能是最常见的模式，因为它可以用于瓷砖纹理，如地板和墙壁。
+
+```cpp
+samplerInfo.anisotropyEnable = VK_TRUE;
+samplerInfo.maxAnisotropy = ???;
+```
+
+这两个字段指定是否应该使用各向异性过滤。除非考虑性能问题，否则没有理由不使用它。`maxAnisotropy`字段限制了可用于计算最终颜色的纹理样本的数量。值越低，性能越好，但质量越低。为了找出我们可以使用哪个值，我们需要像这样检索物理设备的属性:
+
+```cpp
+VkPhysicalDeviceProperties properties{};
+vkGetPhysicalDeviceProperties(physicalDevice, &properties);
+```
+
+如果您查看`VkPhysicalDeviceProperties`结构的文档，您将看到它包含一个名为`limits`的`VkPhysicalDeviceLimits`成员。这个结构体又有一个名为`maxSamplerAnisotropy`的成员，这是我们可以为`maxAnisotropy`指定的最大值。如果我们想要获得最大质量，我们可以直接使用这个值:
+
+```cpp
+samplerInfo.maxAnisotropy = properties.limits.maxSamplerAnisotropy;
+```
+
+您可以在程序的开头查询这些属性，并将它们传递给需要它们的函数，或者在 `createTextureSampler` 函数本身查询这些属性。
+
+```cpp
+samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
+```
+
+`borderColor`字段指定当使用clamp to border寻址模式对图像进行采样时返回的颜色。可以以float或int格式中返回黑色、白色或透明。不能指定任意颜色
+
+```cpp
+samplerInfo.unnormalizedCoordinates = VK_FALSE;
+```
+
+`unnormalizedCoordinates`字段指定了你想用哪个坐标系来处理图像中的texel。如果这个字段是`VK_TRUE`，那么你可以简单地在`[0,texWidth)`和`[0,texHeight)`范围内使用坐标。如果它是`VK_FALSE`，那么所有轴上的texel都使用`[0,1)`范围进行处理。现实世界的应用程序几乎总是使用标准化的坐标，因为这样就可以使用具有完全相同坐标的不同分辨率的纹理。
+
+```cpp
+samplerInfo.compareEnable = VK_FALSE;
+samplerInfo.compareOp = VK_COMPARE_OP_ALWAYS;
+```
+
+如果启用了比较函数，那么texels将首先与一个值进行比较，比较的结果将用于筛选操作。这主要用于阴影贴图的[percentage-closer filtering](https://developer.nvidia.com/gpugems/GPUGems/gpugems_ch11.html)。我们将在以后的章节中讨论这个问题。
+
+```cpp
+samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+samplerInfo.mipLodBias = 0.0f;
+samplerInfo.minLod = 0.0f;
+samplerInfo.maxLod = 0.0f;
+```
+
+以上所有这些字段都将用于 mipmapping。我们将在后面的章节中讨论 mipmapping，但基本上它是另一种可以应用的过滤器。
+
+采样器的功能现在已经完全确定。添加一个类成员来持有采样器对象的句柄，并使用`vkCreateSampler`创建采样器:
+
+```cpp
+VkImageView textureImageView;
+VkSampler textureSampler;
+
+...
+
+void createTextureSampler() {
+    ...
+
+    if (vkCreateSampler(device, &samplerInfo, nullptr, &textureSampler) != VK_SUCCESS) {
+        throw std::runtime_error("failed to create texture sampler!");
+    }
+}
+```
+
+注意，采样器没有在任何地方引用`VkImage`。采样器是一个独特的对象，它提供了从纹理中提取颜色的接口。它可以应用于任何你想要的图像，无论是1D、2D还是3D。这与许多较老的api不同，后者将纹理图像和过滤组合成单个状态。
+
+当我们不再访问图片时，在程序结束时销毁取样器:
+
+```cpp
+void cleanup() {
+    cleanupSwapChain();
+
+    vkDestroySampler(device, textureSampler, nullptr);
+    vkDestroyImageView(device, textureImageView, nullptr);
+
+    ...
+}
+```
+
+#### Anisotropy device feature 各向异性器件特性
+
+如果你现在运行你的程序，你会看到这样的验证层消息:
+
+![Anisotropy](img/Anisotropy.png)
+
+这是因为各向异性过滤实际上是一个可选的设备功能。我们需要更新`createLogicalDevice`函数来请求它:
+
+```cpp
+VkPhysicalDeviceFeatures deviceFeatures{};
+deviceFeatures.samplerAnisotropy = VK_TRUE;
+```
+
+尽管现代显卡不太可能不支持它，但我们应该更新 `isDeviceSuitable` 来检查它是否可用:
+
+```cpp
+bool isDeviceSuitable(VkPhysicalDevice device) {
+    ...
+
+    VkPhysicalDeviceFeatures supportedFeatures;
+    vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
+
+    return indices.isComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.samplerAnisotropy;
+}
+```
+
+`vkGetPhysicalDeviceFeatures` 重用 `VkPhysicalDeviceFeatures` 结构来指示哪些功能是支持的，而不是通过设置布尔值来请求的。
+
+除了加强各向异性过滤的可用性，也可以通过设置条件而不使用它:
+
+```cpp
+samplerInfo.anisotropyEnable = VK_FALSE;
+samplerInfo.maxAnisotropy = 1.0f;
+```
+
+在下一章中，我们将把图像和采样器对象暴露给着色器，以便在正方形上绘制纹理。
+
