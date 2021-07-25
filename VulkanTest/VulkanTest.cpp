@@ -76,6 +76,7 @@ struct SwapChainSupportDetails {
 struct Vertex {
     glm::vec2 pos;
     glm::vec3 color;
+    glm::vec2 texCoord;
 
     static VkVertexInputBindingDescription getBindingDescription() {
         VkVertexInputBindingDescription bindingDescription{};
@@ -87,8 +88,8 @@ struct Vertex {
         return bindingDescription;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 2> getAttributesDescriptions() {
-        std::array<VkVertexInputAttributeDescription, 2> attributeDescriptions{};
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributesDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
         
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
@@ -99,6 +100,12 @@ struct Vertex {
         attributeDescriptions[1].location = 1;
         attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
         attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
         return attributeDescriptions;
     }
 };
@@ -110,10 +117,10 @@ struct UniformBufferObject {
 };
 
 const std::vector<Vertex> vertices = {
-    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}},
-    {{0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}},
-    {{0.5f, 0.5f}, {0.0f, 0.0f, 1.0f}},
-    {{-0.5f, 0.5f}, {1.0f, 1.0f, 1.0f}}
+    {{-0.5f, -0.5f}, {0.0f, 0.0f, 0.0f},{1.0f,0.0f}},
+    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f},{0.0f,0.0f}},
+    {{ 0.5f,  0.5f}, {1.0f, 1.0f, 0.0f},{0.0f,1.0f}},
+    {{-0.5f,  0.5f}, {1.0f, 0.0f, 0.0f},{1.0f,1.0f}}
 };
 
 const std::vector<uint16_t> indices = {
@@ -431,7 +438,11 @@ private:
             SwapChainSupportDetails swapChainSupport = querySwapChainSupport(device);
             swapChainAdequate = !swapChainSupport.formats.empty() && !swapChainSupport.presentModes.empty();
         }
-        return indices.isComplete() && extensionsSupported && swapChainAdequate;
+
+        VkPhysicalDeviceFeatures supportedFeatures;
+        vkGetPhysicalDeviceFeatures(device, &supportedFeatures);
+
+        return indices.isComplete() && extensionsSupported && swapChainAdequate && supportedFeatures.samplerAnisotropy;
     }
     // 检查设备支持性
 
@@ -507,6 +518,7 @@ private:
         }
 
         VkPhysicalDeviceFeatures deviceFeatures{};
+        deviceFeatures.samplerAnisotropy = VK_TRUE;
 
         VkDeviceCreateInfo createInfo{};
         createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -1193,10 +1205,19 @@ private:
         uboLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
         uboLayoutBinding.pImmutableSamplers = nullptr;
 
+        VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+        samplerLayoutBinding.binding = 1;
+        samplerLayoutBinding.descriptorCount = 1;
+        samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        samplerLayoutBinding.pImmutableSamplers = nullptr;
+        samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings = { uboLayoutBinding,samplerLayoutBinding };
+
         VkDescriptorSetLayoutCreateInfo layoutInfo{};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        layoutInfo.bindingCount = 1;
-        layoutInfo.pBindings = &uboLayoutBinding;
+        layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
 
         if (vkCreateDescriptorSetLayout(device, &layoutInfo, nullptr, &descriptorSetLayout) != VK_SUCCESS) {
             throw std::runtime_error("failed to create descriptor set layout!");
@@ -1233,14 +1254,16 @@ private:
     }
 
     void createDescriptorPool() {
-        VkDescriptorPoolSize poolSize{};
-        poolSize.type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSize.descriptorCount = static_cast<uint32_t>(swapChainImages.size());
+        std::array<VkDescriptorPoolSize, 2>poolSizes{};
+        poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[0].descriptorCount = static_cast<uint32_t>(swapChainImages.size());
+        poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[1].descriptorCount = static_cast<uint32_t>(swapChainImages.size());
         
         VkDescriptorPoolCreateInfo poolInfo{};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        poolInfo.poolSizeCount = 1;
-        poolInfo.pPoolSizes = &poolSize;
+        poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+        poolInfo.pPoolSizes = poolSizes.data();
         poolInfo.maxSets = static_cast<uint32_t>(swapChainImages.size());
 
         if (vkCreateDescriptorPool(device, &poolInfo, nullptr, &descriptorPool) != VK_SUCCESS) {
@@ -1267,18 +1290,29 @@ private:
             bufferInfo.offset = 0;
             bufferInfo.range = sizeof(UniformBufferObject);
             
-            VkWriteDescriptorSet descriptorWirte{};
-            descriptorWirte.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            descriptorWirte.dstSet = descriptorSets[i];
-            descriptorWirte.dstBinding = 0;
-            descriptorWirte.dstArrayElement = 0;
-            descriptorWirte.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            descriptorWirte.descriptorCount = 1;
-            descriptorWirte.pBufferInfo = &bufferInfo;
-            descriptorWirte.pImageInfo = nullptr;
-            descriptorWirte.pTexelBufferView = nullptr;
+            VkDescriptorImageInfo imageInfo{};
+            imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            imageInfo.imageView = textureImageView;
+            imageInfo.sampler = textureSampler;
 
-            vkUpdateDescriptorSets(device, 1, &descriptorWirte, 0, nullptr);
+            std::array< VkWriteDescriptorSet,2> descriptorWirte{};
+            descriptorWirte[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWirte[0].dstSet = descriptorSets[i];
+            descriptorWirte[0].dstBinding = 0;
+            descriptorWirte[0].dstArrayElement = 0;
+            descriptorWirte[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+            descriptorWirte[0].descriptorCount = 1;
+            descriptorWirte[0].pBufferInfo = &bufferInfo;
+
+            descriptorWirte[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            descriptorWirte[1].dstSet = descriptorSets[i];
+            descriptorWirte[1].dstBinding = 1;
+            descriptorWirte[1].dstArrayElement = 0;
+            descriptorWirte[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            descriptorWirte[1].descriptorCount = 1;
+            descriptorWirte[1].pImageInfo = &imageInfo;
+
+            vkUpdateDescriptorSets(device,static_cast<uint32_t>(descriptorWirte.size()) , descriptorWirte.data(), 0, nullptr);
         }
     }
 
@@ -1422,7 +1456,7 @@ private:
 
         vkCmdPipelineBarrier(
             commandBuffer,
-            0, 0,
+            sourceStage, destinaionStage,
             0,
             0, nullptr,
             0, nullptr,

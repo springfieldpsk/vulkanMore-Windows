@@ -2244,3 +2244,233 @@ samplerInfo.maxAnisotropy = 1.0f;
 
 在下一章中，我们将把图像和采样器对象暴露给着色器，以便在正方形上绘制纹理。
 
+### Combined image sampler 组合图像采样器
+
+#### Introduction  引言
+
+我们第一次在教程的uniform buffers部分研究了描述符。在本章中，我们将看到一种新的描述符: 组合图像采样器。这个描述符使得着色器可以通过一个采样器对象访问图像资源，就像我们在前一章中创建的那样。
+
+我们将首先修改描述符布局、描述符池和描述符集，以包含这样的组合图像采样描述符。在此之后，我们将添加纹理坐标至`Vertex`和修改片段着色器从纹理读取颜色，而不是仅仅通过顶点插值获取颜色。
+
+#### Updating the descriptors 更新描述符
+
+浏览`createDescriptorSetLayout`函数，并为组合图像采样描述符添加一个`VkDescriptorSetLayoutBinding`。我们将简单地把它放在uniform buffers之后的绑定中:
+
+```cpp
+VkDescriptorSetLayoutBinding samplerLayoutBinding{};
+samplerLayoutBinding.binding = 1;
+samplerLayoutBinding.descriptorCount = 1;
+samplerLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+samplerLayoutBinding.pImmutableSamplers = nullptr;
+samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+
+std::array<VkDescriptorSetLayoutBinding, 2> bindings = {uboLayoutBinding, samplerLayoutBinding};
+VkDescriptorSetLayoutCreateInfo layoutInfo{};
+layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
+layoutInfo.pBindings = bindings.data();
+```
+
+确保设置 `stageFlags` 以表明我们打算在片段着色器中使用组合图像采样描述符。这就是确定片段颜色的地方。我们可以在顶点着色器中使用纹理采样，例如，通过[高度图](https://en.wikipedia.org/wiki/Heightmap)动态变形顶点网格。
+
+我们还必须创建一个更大的描述符池，通过将另一个类型为`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`的`VkPoolSize`添加到`VkDescriptorPoolCreateInfo`中来为组合图像采样器的分配腾出空间。转到`createDescriptorPool`函数并修改它，使其包含这个描述符的`VkDescriptorPoolSize`:
+
+```cpp
+std::array<VkDescriptorPoolSize, 2> poolSizes{};
+poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+poolSizes[0].descriptorCount = static_cast<uint32_t>(swapChainImages.size());
+poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+poolSizes[1].descriptorCount = static_cast<uint32_t>(swapChainImages.size());
+
+VkDescriptorPoolCreateInfo poolInfo{};
+poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+poolInfo.poolSizeCount = static_cast<uint32_t>(poolSizes.size());
+poolInfo.pPoolSizes = poolSizes.data();
+poolInfo.maxSets = static_cast<uint32_t>(swapChainImages.size());
+```
+
+某些问题验证层不会捕获，不足的描述符池就是一个很好的例子: 在 Vulkan 1.1中，如果描述符池空间不足，`vkAllocateDescriptorSets` 可能会失败，错误代码为 `VK_ERROR_POOL_OUT_OF_MEMORY`，但是驱动程序也可能尝试在内部解决这个问题。这意味着有时候(取决于硬件、池大小和分配大小)驱动程序会让我们得到超出描述符池限制的分配。而另外一些时候，`vkAllocateDescriptorSets` 将失败并返回 `VK_ERROR_POOL_OUT_OF_MEMORY`。若分配在某些机器上成功，但在其他机器上失败，会是一件让特别令人沮丧的事。
+
+因为 Vulkan 将分配的责任转移到驱动程序，所以不再严格要求只分配由相应的`descriptorCount`指定的相同数量的特定类型的描述符(`VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER`，等等)。然而，我们还是应该按照指定的要求来做，若以后启用[Best Practice Validation](https://vulkan.lunarg.com/doc/view/1.1.126.0/windows/best_practices.html)，`VK_LAYER_KHRONOS_validation` 将会警告这种类型的问题。
+
+最后一步是将实际图像和采样器资源绑定到描述符集中的描述符。转到 `createDescriptorSets` 函数。
+
+```cpp
+for (size_t i = 0; i < swapChainImages.size(); i++) {
+    VkDescriptorBufferInfo bufferInfo{};
+    bufferInfo.buffer = uniformBuffers[i];
+    bufferInfo.offset = 0;
+    bufferInfo.range = sizeof(UniformBufferObject);
+
+    VkDescriptorImageInfo imageInfo{};
+    imageInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    imageInfo.imageView = textureImageView;
+    imageInfo.sampler = textureSampler;
+
+    ...
+}
+```
+
+组合图像采样器结构的资源必须在 `VkDescriptorImageInfo` 结构中指定，就像在 `VkDescriptorBufferInfo` 结构中指定uniform buffer描述符的缓冲区资源一样。这就是上一章中的对象聚集到一起的地方。
+
+```cpp
+std::array<VkWriteDescriptorSet, 2> descriptorWrites{};
+
+descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+descriptorWrites[0].dstSet = descriptorSets[i];
+descriptorWrites[0].dstBinding = 0;
+descriptorWrites[0].dstArrayElement = 0;
+descriptorWrites[0].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+descriptorWrites[0].descriptorCount = 1;
+descriptorWrites[0].pBufferInfo = &bufferInfo;
+
+descriptorWrites[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+descriptorWrites[1].dstSet = descriptorSets[i];
+descriptorWrites[1].dstBinding = 1;
+descriptorWrites[1].dstArrayElement = 0;
+descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+descriptorWrites[1].descriptorCount = 1;
+descriptorWrites[1].pImageInfo = &imageInfo;
+
+vkUpdateDescriptorSets(device, static_cast<uint32_t>(descriptorWrites.size()), descriptorWrites.data(), 0, nullptr);
+```
+
+就像缓冲区一样，描述符必须用这个图像信息更新。这次我们使用的是 `pImageInfo` 数组而不是 `pBufferInfo` 。描述符现在已经准备好被着色器使用了
+
+#### Texture coordinates 纹理坐标
+
+纹理映射还缺少一个重要的组成部分，那就是每个顶点的实际坐标。这些坐标决定了图像实际上是如何映射到几何体的。
+
+```cpp
+struct Vertex {
+    glm::vec2 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    static VkVertexInputBindingDescription getBindingDescription() {
+        VkVertexInputBindingDescription bindingDescription{};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
+
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
+        return attributeDescriptions;
+    }
+};
+```
+
+修改 `Vertex` 结构以包含一个 `vec2` 表示纹理坐标。一定要添加一个 `VkVertexInputAttributeDescription` ，这样我们就可以使用纹理坐标作为顶点着色器的输入。这是必要的，以便能够通过它们的片段着色器插值整个正方形的表面。
+
+```cpp
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f}, {1.0f, 0.0f, 0.0f},{1.0f,0.0f}},
+    {{ 0.5f, -0.5f}, {0.0f, 1.0f, 0.0f},{0.0f,0.0f}},
+    {{ 0.5f,  0.5f}, {0.0f, 0.0f, 1.0f},{0.0f,1.0f}},
+    {{-0.5f,  0.5f}, {1.0f, 1.0f, 1.0f},{1.0f,1.0f}}
+};
+```
+
+在本教程中，我将使用从左上角的`0,0`到右下角的`1,1`的坐标简单地用纹理填充正方形。你可以随意尝试不同的坐标。尝试使用0以下或以上1的坐标，看看寻址模式的行动！
+
+#### Shaders 着色器
+
+最后一步是修改着色器从纹理中取样颜色。我们首先需要修改顶点着色器，以便通过纹理坐标传递到片段着色器:
+
+```GLSL
+layout(location = 0) in vec2 inPosition;
+layout(location = 1) in vec3 inColor;
+layout(location = 2) in vec2 inTexCoord;
+
+layout(location = 0) out vec3 fragColor;
+layout(location = 1) out vec2 fragTexCoord;
+
+void main() {
+    gl_Position = ubo.proj * ubo.view * ubo.model * vec4(inPosition, 0.0, 1.0);
+    fragColor = inColor;
+    fragTexCoord = inTexCoord;
+}
+```
+
+就像每个顶点的颜色一样， `fragTexCoord` 值将通过光栅化器平滑插值到正方形区域中。我们可以通过使用片段着色器将纹理坐标输出为颜色来实现可视化:
+
+```GLSL
+#version 450
+
+layout(location = 0) in vec3 fragColor;
+layout(location = 1) in vec2 fragTexCoord;
+
+layout(location = 0) out vec4 outColor;
+
+void main() {
+    outColor = vec4(fragTexCoord, 0.0, 1.0);
+}
+```
+
+您应该看到类似下面的图像。不要忘记重新编译着色器！
+
+![texcoord_visualization](img/texcoord_visualization.png)
+
+绿色通道表示水平坐标，红色通道表示垂直坐标。黑色和黄色的边角确认纹理坐标在正方形的`0,0`到`1,1`之间被正确插值。由于没有更好的选择，所以使用颜色可视化数据在着色器编程替代 printf 调试。
+
+在 GLSL 中，组合图像采样描述符用采样均匀表示。在片段着色器中添加对它的引用:
+
+```GLSL
+layout(binding = 1) uniform sampler2D texSampler;
+```
+
+对于其他类型的图像，有等效的 `sample1d` 和 `sampler3D` 类型，确保使用正确的采样器类型。
+
+```GLSL
+void main() {
+    outColor = texture(texSampler, fragTexCoord);
+}
+```
+
+纹理采样使用内置的 `texture` 函数。它采用一个 `sampler` 和坐标作为参数。采样器自动处理背景中的滤波和变换。现在，当你运行应用程序时，你应该看到方块上的纹理:
+
+![texture_on_square](img/texture_on_square.png)
+
+尝试通过缩放纹理坐标值大于1来实验寻址模式。例如，当使用 `VK_SAMPLER_ADDRESS_MODE_REPEAT` 时，下面的片段着色器在下面的图像中产生结果:
+
+```GLSL
+void main() {
+    outColor = texture(texSampler, fragTexCoord * 2.0);
+}
+```
+
+![texture_on_square_repeated](img/texture_on_square_repeated.png)
+
+你也可以使用顶点颜色来操作纹理颜色:
+
+```GLSL
+void main() {
+    outColor = vec4(fragColor * texture(texSampler, fragTexCoord).rgb, 1.0);
+}
+```
+
+这里分离了 RGB 和 alpha 通道，以防止 alpha 通道受到缩放干扰
+
+![texture_on_square_colorized](img/texture_on_square_colorized.png)
+
+您现在知道如何访问着色器的图像！这是一种非常强大的技术，当与也写入 framebuffer 的图像结合时。您可以使用这些图像作为输入，以实现炫酷的效果，如在3D 世界中的后处理和相机显示。
+
