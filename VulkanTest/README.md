@@ -2474,3 +2474,103 @@ void main() {
 
 您现在知道如何访问着色器的图像！这是一种非常强大的技术，当与也写入 framebuffer 的图像结合时。您可以使用这些图像作为输入，以实现炫酷的效果，如在3D 世界中的后处理和相机显示。
 
+## Depth buffering 深度缓冲
+
+### Introduction 深度缓冲引言
+
+到目前为止，我们使用的几何图形被投影成3 d 图形，但它仍然是完全平坦的。在这一章中，我们要在这个位置加上一个 z 坐标来准备三维网格。我们将使用这个第三个坐标在当前的正方形上放置一个正方形，以查看当几何图形没有按深度排序时出现的问题。
+
+### 3D geometry 3d几何
+
+更改 `Vertex` 结构以使用 3d 向量表示位置，并更新相应的 `VkVertexInputAttributeDescription` 格式:
+
+```cpp
+struct Vertex {
+    glm::vec3 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    ...
+
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions{};
+
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        ...
+    }
+};
+```
+
+接下来，更新顶点着色器以接受和转换3D 坐标作为输入。不要忘记重新编译它！
+
+```GLSL
+layout(location = 0) in vec3 inPosition;
+
+...
+
+void main() {
+    gl_Position = ubo.proj * ubo.view * ubo.model * vec4(inPosition, 1.0);
+    fragColor = inColor;
+    fragTexCoord = inTexCoord;
+}
+```
+
+最后，将`vertices`容器更新为包含 z 坐标:
+
+```cpp
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
+};
+```
+
+如果您现在运行应用程序，那么您应该会看到与以前完全相同的结果。现在是时候添加一些额外的几何图形，使场景更加有趣，并演示我们将在本章中处理的问题。复制顶点来定义一个正方形在当前顶点下面的位置，如下所示:
+
+![extra_square](img/extra_square.svg)
+
+使用 `-0.5f` 的 z 坐标，并为额外的方块添加适当的索引:
+
+```cpp
+const std::vector<Vertex> vertices = {
+    {{-0.5f, -0.5f, 0.0f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, 0.0f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, 0.0f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, 0.0f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}},
+
+    {{-0.5f, -0.5f, -0.5f}, {1.0f, 0.0f, 0.0f}, {0.0f, 0.0f}},
+    {{0.5f, -0.5f, -0.5f}, {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f}},
+    {{0.5f, 0.5f, -0.5f}, {0.0f, 0.0f, 1.0f}, {1.0f, 1.0f}},
+    {{-0.5f, 0.5f, -0.5f}, {1.0f, 1.0f, 1.0f}, {0.0f, 1.0f}}
+};
+
+const std::vector<uint16_t> indices = {
+    0, 1, 2, 2, 3, 0,
+    4, 5, 6, 6, 7, 4
+};
+```
+
+现在运行你的程序，你会看到一个类似埃舍尔的例子:
+
+![depth_issues](img/depth_issues.png)
+
+问题是，下方块的片段被绘制在上方块的片段之上，仅仅因为它在索引数组的后面。有两种方法可以解决这个问题:
+
+- 按深度从后到前排序调用所有的绘图操作
+- 使用深度缓冲器进行深度测试
+
+第一种方法通常用于绘制透明对象，因为与顺序无关的透明性是一个难以解决的挑战。然而，根据深度排序片段的问题通常使用深度缓冲器来解决。深度缓冲器是一个附加的附件，它存储每个位置的深度，就像颜色附件存储每个位置的颜色一样。每当光栅化程序产生一个片段时，深度测试将检查新片段是否比前一个片段更接近。如果不是，那么新的片段就会被丢弃。通过深度测试的片段将自己的深度写入深度缓冲区。可以从片段着色器中操纵这个值，就像操纵颜色输出一样。
+
+```cpp
+#define GLM_FORCE_RADIANS
+#define GLM_FORCE_DEPTH_ZERO_TO_ONE
+#include <glm/glm.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+```
+
+由GLM生成的透视投影矩阵默认使用OpenGL深度范围-1.0到1.0。我们需要使用`GLM_FORCE_DEPTH_ZERO_TO_ONE`定义将其配置为使用0.0到1.0的Vulkan范围。
