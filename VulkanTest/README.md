@@ -2574,3 +2574,389 @@ const std::vector<uint16_t> indices = {
 ```
 
 由GLM生成的透视投影矩阵默认使用OpenGL深度范围-1.0到1.0。我们需要使用`GLM_FORCE_DEPTH_ZERO_TO_ONE`定义将其配置为使用0.0到1.0的Vulkan范围。
+
+### Depth image and view 深度图和视图
+
+深度附件是基于图像的，就像颜色附件一样。不同之处在于交换链不会自动为我们创建深度图像。我们只需要一个深度图像，因为一次只运行一个绘制操作。深度图像将再次需要三重资源: 图像，内存和图像视图。
+
+```cpp
+VkImage depthImage;
+VkDeviceMemory depthImageMemory;
+VkImageView depthImageView;
+```
+
+创建一个新的函数 `createDepthResources` 来设置这些资源:
+
+```cpp
+void initVulkan() {
+    ...
+    createCommandPool();
+    createDepthResources();
+    createTextureImage();
+    ...
+}
+
+...
+
+void createDepthResources() {
+
+}
+```
+
+创建深度图像是相当简单的。它应该具有与颜色附件相同的分辨率，并根据交换链范围、适用于深度附件的图像使用、最佳的平铺和设备本地内存定义。唯一的问题是: 深度图像的正确格式是什么？格式必须包含一个深度分量，在`VK_FORMAT_`中由 `_D??_` 指示。
+
+不同于纹理图像，我们不一定需要特定的格式，因为我们不会直接从程序访问texels。它只是需要有一个合理的精度，在现实世界的应用中通常至少为24位。有几种格式符合这一要求:
+
+- `VK_FORMAT_D32_SFLOAT` 32位浮点表示深度
+- `VK_FORMAT_D32_SFLOAT_S8_UINT` 32位浮点表示深度,8位表示模板组件
+- `VK_FORMAT_D24_UNORM_S8_UINT` 24位浮点表示深度,8位表示模板组件
+
+模板组件用于模板测试，这是一个附加测试，可以结合深度测试。我们将在以后的章节中讨论这个问题。
+
+我们可以简单地使用`VK_FORMAT_D32_SFLOAT`格式，因为对它的支持非常常见(请参阅硬件数据库) ，但是如果可能的话，为我们的应用程序增加一些额外的灵活性是很好的。我们将编写一个函数 `findSupportedFormat` ，它按照从最理想到最不理想的顺序获取一个候选格式列表，并检查哪个是第一个支持的格式:
+
+```cpp
+VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features) {
+
+}
+```
+
+对格式的支持取决于平铺模式和使用方式，因此我们还必须将它们作为参数包括进来。格式的支持可以使用 `vkGetPhysicalDeviceFormatProperties` 函数查询:
+
+```cpp
+for (VkFormat format : candidates) {
+    VkFormatProperties props;
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+}
+```
+
+`VkFormatProperties`结构包括三个字段
+
+- `linearTilingFeatures` 支持线性平铺的用例
+- `optimalTilingFeatures` 支持最佳平铺支持的用例
+- `bufferFeatures` 支持缓冲区的用例
+
+这里只有前两个是有用的，首先我们要检查的是函数的平铺参数
+
+```cpp
+if (tiling == VK_IMAGE_TILING_LINEAR && (props.linearTilingFeatures & features) == features) {
+    return format;
+} else if (tiling == VK_IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures & features) == features) {
+    return format;
+}
+```
+
+如果没有一个候选格式支持所需的用法，那么我们可以返回一个特殊的值或者简单地抛出一个异常:
+
+```cpp
+VkFormat findSupportedFormat(const std::vector<VkFormat>& candidates, VkImageTiling tiling, VkFormatFeatureFlags features) {
+    for (VkFormat format : candidates) {
+        VkFormatProperties props;
+        vkGetPhysicalDeviceFormatProperties(physicalDevice, format, &props);
+
+        if (tiling == VK_IMAGE_TILING_LINEAR && (props.linearTilingFeatures & features) == features) {
+            return format;
+        } else if (tiling == VK_IMAGE_TILING_OPTIMAL && (props.optimalTilingFeatures & features) == features) {
+            return format;
+        }
+    }
+
+    throw std::runtime_error("failed to find supported format!");
+}
+```
+
+现在我们将使用这个函数来创建一个 `findDepthFormat` 助手函数来选择一个带有深度组件的格式，该格式支持深度附件的使用:
+
+```cpp
+VkFormat findDepthFormat() {
+    return findSupportedFormat(
+        {VK_FORMAT_D32_SFLOAT, VK_FORMAT_D32_SFLOAT_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT},
+        VK_IMAGE_TILING_OPTIMAL,
+        VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT
+    );
+}
+```
+
+在这种情况下，请确保使用 `VK_FORMAT_FEATURE_` 标志而不是 `VK_IMAGE_USAGE_` 标志。所有这些候选格式都包含一个深度组件，但后两个也包含一个模具组件。我们现在还不会使用这些格式，但是在使用这些格式的图像执行布局转换时，我们需要考虑到这一点。添加一个简单的辅助函数，告诉我们所选择的深度格式是否包含模具组件:
+
+```cpp
+bool hasStencilComponent(VkFormat format) {
+    return format == VK_FORMAT_D32_SFLOAT_S8_UINT || format == VK_FORMAT_D24_UNORM_S8_UINT;
+}
+```
+
+从 `createDepthResources` 中调用该函数查找深度格式:
+
+```cpp
+VkFormat depthFormat = findDepthFormat();
+```
+
+我们现在有了所有必需的信息来调用我们的 `createImage` 和 `createImageView` 辅助函数:
+
+```cpp
+createImage(swapChainExtent.width, swapChainExtent.height, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+depthImageView = createImageView(depthImage, depthFormat);
+```
+
+然而， `createImageView` 函数目前假设子资源始终是 `VK_IMAGE_ASPECT_COLOR_BIT`，因此我们需要将该字段转换为函数的一个参数:
+
+使用正确的aspect来更新对这个函数的所有调用:
+
+```cpp
+swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT);
+...
+depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT);
+...
+textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT);
+```
+
+这就是创建深度图像的方法。我们不需要映射它或者复制另一个图像到它，因为我们要在渲染通道开始的时候清除它，就像色彩附件一样。
+
+### Explicitly transitioning the depth image 显式转换深度图
+
+我们不需要显式地将图像的布局转换为深度附件，因为我们会在渲染通道中处理这个问题。但是，为了完整起见，我仍将在本节中描述这个过程。如果你愿意，你可以跳过它。
+
+在 `createDepthResources` 函数的末尾调用 `transitionimagelayout` ，如下所示:
+
+```cpp
+transitionImageLayout(depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL);
+```
+
+未定义的布局可以用作初始布局，因为现有的深度图像内容不重要。我们需要更新 `transitionimageelayout` 中的一些逻辑，以使用正确的子资源aspect:
+
+```cpp
+if (newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+
+    if (hasStencilComponent(format)) {
+        barrier.subresourceRange.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
+    }
+} else {
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+}
+```
+
+虽然我们没有使用模板组件，但是我们还是需要将其包含在深度图像的布局变换中。
+
+最后，添加正确的访问掩码和管道阶段:
+
+```cpp
+if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+    sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    destinationStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+} else if (oldLayout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL && newLayout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    sourceStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    destinationStage = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+} else if (oldLayout == VK_IMAGE_LAYOUT_UNDEFINED && newLayout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) {
+    barrier.srcAccessMask = 0;
+    barrier.dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+
+    sourceStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    destinationStage = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+} else {
+    throw std::invalid_argument("unsupported layout transition!");
+}
+```
+
+将从深度缓冲区读取以执行深度测试，以确认片段是否可见，并在绘制新片段时将其写入深度缓冲区。读取发生在 `VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT`  阶段，写入发生在 `VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT` 阶段。您应该选择与指定操作匹配的最早的管道阶段，以便在需要时可以将其作为深度附件使用。
+
+### Render pass 渲染通道
+
+我们现在要修改 `createRenderPass` 来包含一个深度附件:
+
+```cpp
+VkAttachmentDescription depthAttachment{};
+depthAttachment.format = findDepthFormat();
+depthAttachment.samples = VK_SAMPLE_COUNT_1_BIT;
+depthAttachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+depthAttachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+depthAttachment.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+depthAttachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+depthAttachment.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+depthAttachment.finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+```
+
+`format`字段应该与深度图像本身相同。这次我们不关心存储深度数据(`storeOp`) ，因为在绘图完成后将不会使用它。这可能允许硬件执行额外的优化。就像颜色缓冲区一样，我们不关心以前的深度内容，所以我们可以使用 `VK_IMAGE_LAYOUT_UNDEFINED` 作为 `initialLayout`。
+
+```cpp
+VkAttachmentReference depthAttachmentRef{};
+depthAttachmentRef.attachment = 1;
+depthAttachmentRef.layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+```
+
+为第一个(也是唯一的)子通道添加附件引用:
+
+```cpp
+VkSubpassDescription subpass{};
+subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
+subpass.colorAttachmentCount = 1;
+subpass.pColorAttachments = &colorAttachmentRef;
+subpass.pDepthStencilAttachment = &depthAttachmentRef;
+```
+
+与彩色附件不同，子通道只能使用单个深度(+模板)附件。在多个缓冲区上做深度测试实际上没有任何意义。
+
+```cpp
+std::array<VkAttachmentDescription, 2> attachments = {colorAttachment, depthAttachment};
+VkRenderPassCreateInfo renderPassInfo{};
+renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
+renderPassInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+renderPassInfo.pAttachments = attachments.data();
+renderPassInfo.subpassCount = 1;
+renderPassInfo.pSubpasses = &subpass;
+renderPassInfo.dependencyCount = 1;
+renderPassInfo.pDependencies = &dependency;
+```
+
+接下来，更新 `VkRenderPassCreateInfo` 结构以引用这两个附件。
+
+```cpp
+dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
+dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+```
+
+最后，我们需要扩展子通道依赖关系，以确保深度图像的过渡与作为其加载操作的一部分被清除之间没有冲突。深度图像在早期片段测试管道阶段第一次被访问，因为我们有一个清除的加载操作，我们应该为写指定访问掩码。
+
+### Framebuffer 帧缓冲区
+
+下一步是修改 `framebuffer` 创建，以将深度图像绑定到深度附件。转到 `createFramebuffers` ，将深度图像视图指定为第二个附件:
+
+```cpp
+std::array<VkImageView, 2> attachments = {
+    swapChainImageViews[i],
+    depthImageView
+};
+
+VkFramebufferCreateInfo framebufferInfo{};
+framebufferInfo.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
+framebufferInfo.renderPass = renderPass;
+framebufferInfo.attachmentCount = static_cast<uint32_t>(attachments.size());
+framebufferInfo.pAttachments = attachments.data();
+framebufferInfo.width = swapChainExtent.width;
+framebufferInfo.height = swapChainExtent.height;
+framebufferInfo.layers = 1;
+```
+
+每个交换链映像的颜色附件是不同的，但是所有的交换链映像都可以使用相同的深度映像，因为由于信号量的原因，只有一个子通道同时运行。
+
+您还需要将调用移动到 `createFramebuffers` ，以确保在深度图像视图实际创建之后调用它:
+
+```cpp
+void initVulkan() {
+    ...
+    createDepthResources();
+    createFramebuffers();
+    ...
+}
+```
+
+### Clear values
+
+因为我们现在有多个带有 `VK_ATTACHMENT_LOAD_OP_CLEAR` 的附件，所以我们还需要指定多个 clear 值。转到 `createCommandBuffers` ，创建一个 `VkClearValue` 结构数组:
+
+```cpp
+std::array<VkClearValue, 2> clearValues{};
+clearValues[0].color = {{0.0f, 0.0f, 0.0f, 1.0f}};
+clearValues[1].depthStencil = {1.0f, 0};
+
+renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+renderPassInfo.pClearValues = clearValues.data();
+```
+
+深度缓冲区的深度范围在 Vulkan 为`0.0`到`1.0`，远景平面为`1.0`，近景平面为`0.0`。深度缓冲区中每个点的初始值应该是可能的最远深度，即`1.0`。
+
+注意 `clearValues` 的顺序应该与附件的顺序相同。
+
+### Depth and stencil state 深度和模板状态
+
+深度附件现在已经可以使用了，但是深度测试仍然需要在绘图管线中心启用。它是通过 `VkPipelineDepthStencilStateCreateInfo` 结构配置的:
+
+```cpp
+VkPipelineDepthStencilStateCreateInfo depthStencil{};
+depthStencil.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+depthStencil.depthTestEnable = VK_TRUE;
+depthStencil.depthWriteEnable = VK_TRUE;
+```
+
+`depthTestEnable` 字段指定是否应该将新片段的深度与深度缓冲区进行比较，以确定是否应该丢弃它们。 `depthWriteEnable` 字段指定是否应将通过深度测试的新片段的深度实际写入深度缓冲区。
+
+```cpp
+depthStencil.depthCompareOp = VK_COMPARE_OP_LESS;
+```
+
+`depthCompareOp` 字段指定为保留或丢弃片段而执行的比较。我们坚持较低深度 = 较近深度的约定，所以新片段的深度应该较小。
+
+```cpp
+depthStencil.depthBoundsTestEnable = VK_FALSE;
+depthStencil.minDepthBounds = 0.0f; // Optional
+depthStencil.maxDepthBounds = 1.0f; // Optional
+```
+
+`depthBoundsTestEnable` 、 `minDepthBounds` 和 `maxDepthBounds` 字段用于可选的深度绑定测试。基本上，这允许您只保留指定深度范围内的片段。我们不会使用这个功能。
+
+```cpp
+depthStencil.stencilTestEnable = VK_FALSE;
+depthStencil.front = {}; // Optional
+depthStencil.back = {}; // Optional
+```
+
+最后三个字段配置模板缓冲区操作，这在本教程中也不会使用。如果要使用这些操作，则必须确保深度/模具图像的格式包含模板组件。
+
+```cpp
+pipelineInfo.pDepthStencilState = &depthStencil;
+```
+
+更新 `VkGraphicsPipelineCreateInfo` 结构以引用我们刚刚填写的深度模具状态。如果渲染通道包含深度模板附件，则必须始终指定深度模板状态。
+
+如果你现在运行你的程序，那么你应该看到几何图形的片段现在被正确排序了:
+
+### Handling window resize 处理窗口大小调整
+
+当调整窗口大小以匹配新的颜色附件分辨率时，深度缓冲区的分辨率应该发生变化。扩展 `recreateSwapChain` 函数，在这种情况下重新创建深度资源:
+
+```cpp
+void recreateSwapChain() {
+    int width = 0, height = 0;
+    while (width == 0 || height == 0) {
+        glfwGetFramebufferSize(window, &width, &height);
+        glfwWaitEvents();
+    }
+
+    vkDeviceWaitIdle(device);
+
+    cleanupSwapChain();
+
+    createSwapChain();
+    createImageViews();
+    createRenderPass();
+    createGraphicsPipeline();
+    createDepthResources();
+    createFramebuffers();
+    createUniformBuffers();
+    createDescriptorPool();
+    createDescriptorSets();
+    createCommandBuffers();
+}
+```
+
+清理操作应该在交换链清理函数中进行:
+
+```cpp
+void cleanupSwapChain() {
+    vkDestroyImageView(device, depthImageView, nullptr);
+    vkDestroyImage(device, depthImage, nullptr);
+    vkFreeMemory(device, depthImageMemory, nullptr);
+
+    ...
+}
+```
+
+恭喜，您的应用程序现在终于可以渲染任意的3D 几何图形了，并且看起来很正确。我们将在下一章通过绘制一个纹理模型来尝试这一点！
+
