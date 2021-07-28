@@ -2960,3 +2960,226 @@ void cleanupSwapChain() {
 
 恭喜，您的应用程序现在终于可以渲染任意的3D 几何图形了，并且看起来很正确。我们将在下一章通过绘制一个纹理模型来尝试这一点！
 
+## Loading models 加载模型
+
+### Introduction 加载模型引言
+
+你的程序现在可以渲染纹理化的三维网格了，但是当前 `vertices` 和 `indices` 数组中的几何图形还不是很有趣。在本章中，我们将扩展程序，从实际的模型文件加载顶点和索引，使图形卡实际上做一些工作。
+
+许多图形 API 教程有读者编写自己的 OBJ 加载程序在这样的一章。这样做的问题是，任何远程有趣的 3d 应用程序很快就会需要这种文件格式不支持的特性，比如骨骼动画。我们将在本章中从 OBJ 模型中加载网格数据，但是我们将更多地集中于将网格数据与程序本身集成，而不是从文件中加载它的细节。
+
+### Library
+
+我们将使用 [tinyobjloader](https://github.com/syoyo/tinyobjloader) 库从 OBJ 文件加载顶点和面。它很快，很容易集成，因为它是一个类似于stb_image的单一的文件库。转到上面链接的存储库，将`tiny_obj_loader.h` 文件下载到库目录中的文件夹中。确保使用 `master` 分支的文件版本，因为最新的正式版本已经过期。
+
+### Sample mesh 样例网格
+
+在本章中，我们还不会启用光照，所以使用一个已经经过光照烘焙的纹理的样本模型会有帮助。找到这种模型的一个简单方法是在 [Sketchfab](https://sketchfab.com/) 上寻找3D扫描。该站点上的许多模型都以OBJ格式提供，并提供许可。
+
+在本教程中，我决定使用 [nigelgoh](https://sketchfab.com/nigelgoh) 的 [Viking room](https://sketchfab.com/3d-models/viking-room-a49f1b8e4f5c4ecf9e1fe7d81915ad38) 模型([CC BY 4.0](https://web.archive.org/web/20200428202538/https://sketchfab.com/3d-models/viking-room-a49f1b8e4f5c4ecf9e1fe7d81915ad38))。我调整了模型的大小和方向，用它替代了当前的几何图形:
+
+- [viking_room.obj](models/viking_room.obj)
+- [viking_room.png](textures/viking_room.png)
+
+你可以随意使用你自己的模型，但要确保它只由一种材质组成，尺寸约为1.5 x 1.5 x 1.5单位。如果它比这个大，你就得改变视图矩阵。把模型文件放在一个新的模型目录下，与 shaders 和 textures 目录位于同一路径下，把纹理图像放在 `textures` 目录下。
+
+在程序中添加两个新的配置变量来定义模型和纹理路径:
+
+```cpp
+const uint32_t WIDTH = 800;
+const uint32_t HEIGHT = 600;
+
+const std::string MODEL_PATH = "models/viking_room.obj";
+const std::string TEXTURE_PATH = "textures/viking_room.png";
+```
+
+然后更新 `createTextureImage` 来使用这个 `path` 变量:
+
+```cpp
+stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+```
+
+### Loading vertices and indices 加载顶点和索引
+
+我们现在要从模型文件中加载顶点和索引，所以您现在应该删除全局顶点和索引数组。将它们替换为非常量容器作为类成员:
+
+```cpp
+std::vector<Vertex> vertices;
+std::vector<uint32_t> indices;
+VkBuffer vertexBuffer;
+VkDeviceMemory vertexBufferMemory;
+```
+
+你应该将索引的类型从 `uint16_t` 改为 `uint32_t` ，因为将会有比65535更多的顶点。记住还要更改 `vkCmdBindIndexBuffer` 参数:
+
+```cpp
+vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+```
+
+`Tinyobjloader` 库的include方式与 `STB` 库相同。包含 `tiny_obj_loader`.h 文件，并确保在一个源文件中定义 `TINYOBJLOADER_IMPLEMENTATION` 以包含函数体并避免链接器错误:
+
+```cpp
+#define TINYOBJLOADER_IMPLEMENTATION
+#include <tiny_obj_loader.h>
+```
+
+我们现在要编写一个 `loadModel` 函数，它使用这个库用来自网格的顶点数据填充顶点和索引容器。它应该在创建顶点和索引缓冲区之前被调用:
+
+```cpp
+void initVulkan() {
+    ...
+    loadModel();
+    createVertexBuffer();
+    createIndexBuffer();
+    ...
+}
+
+...
+
+void loadModel() {
+
+}
+```
+
+一个模型通过调用 `tinyobj::LoadObj` 函数加载到库的数据结构中:
+
+```cpp
+void loadModel() {
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+
+    if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, MODEL_PATH.c_str())) {
+        throw std::runtime_error(warn + err);
+    }
+}
+```
+
+OBJ 文件由位置、法线、纹理坐标和面组成。面由任意数量的顶点组成，其中每个顶点通过索引引用一个位置、法线和/或纹理坐标。这使得不仅可以重用整个顶点，而且可以重用单个属性。
+
+`attrib` 容器保存所有的位置、法线和纹理坐标在`attrib.vertices`, `attrib.normals` 和 `attrib.texcoords`向量中。 `shapes` 容器包含所有独立的对象及其面。每个面由一个顶点数组组成，每个顶点包含位置、法线和纹理坐标属性的索引。OBJ模型也可以定义每个面的材质和纹理，但我们将忽略这些。
+
+`err` 字符串包含错误信息，而`warn`字符串包含加载文件时发生的警告信息，比如缺少材质定义。只有当`LoadObj`函数返回`false`时，加载才真正失败。如上所述，OBJ文件中的面实际上可以包含任意数量的顶点，而我们的应用程序只能渲染三角形。幸运的是， `LoadObj` 有一个可选参数来自动三角化这些面，这在默认情况下是启用的。
+
+我们将把文件中所有的面合并成一个模型，所以只需迭代所有的形状:
+
+```cpp
+for (const auto& shape : shapes) {
+
+}
+```
+
+三角化功能已经确保每个面有三个顶点，所以我们现在可以直接迭代顶点并将它们直接转储到`vertices`向量中:
+
+```cpp
+for (const auto& shape : shapes) {
+    for (const auto& index : shape.mesh.indices) {
+        Vertex vertex{};
+
+        vertices.push_back(vertex);
+        indices.push_back(indices.size());
+    }
+}
+```
+
+为了简单起见，我们假设每个顶点目前都是唯一的，因此使用了简单的自增索引。 `index` 变量的类型是`tinyobj::index_t` ，它包含了`vertex_index`、`normal_index`和`texcoord_index`成员。我们需要使用这些索引来查找 `attrib` 数组中的实际顶点属性:
+
+```cpp
+vertex.pos = {
+    attrib.vertices[3 * index.vertex_index + 0],
+    attrib.vertices[3 * index.vertex_index + 1],
+    attrib.vertices[3 * index.vertex_index + 2]
+};
+
+vertex.texCoord = {
+    attrib.texcoords[2 * index.texcoord_index + 0],
+    attrib.texcoords[2 * index.texcoord_index + 1]
+};
+
+vertex.color = {1.0f, 1.0f, 1.0f};
+```
+
+不幸的是，`attrib.vertices` 数组是一个 `float` 数组，而不是像 `glm::vec3`，因此需要将索引乘以`3`。类似地，每个条目有两个纹理坐标组件。`0`、`1`和`2`的偏移量用于访问 X、 Y 和 Z 分量，或者纹理坐标情况下的 U 和 V 分量。
+
+现在在启用优化的情况下运行程序(例如，在 Visual Studio 中使用 `Release` 模式，在使用 GCC 时开启 `-O3`编译器标志)。这是必要的，因为否则加载模型会非常慢。你应该看到这样的东西:
+
+![inverted_texture_coordinates](img/inverted_texture_coordinates.png)
+
+很好，几何形状看起来是正确的，但是纹理是怎么回事?OBJ格式假设一个坐标系统，其中垂直坐标0表示图像的底部，然而我们将图像上传到Vulkan的是从上到下的方向，其中0表示图像的顶部。我们通过翻转纹理坐标的垂直组件来解决这个问题:
+
+```cpp
+vertex.texCoord = {
+    attrib.texcoords[2 * index.texcoord_index + 0],
+    1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
+};
+```
+
+当你再次运行你的程序时，你应该会看到正确的结果:
+
+![drawing_model](img/drawing_model.png)
+
+所有的努力工作在这样一个演示下开始有回报！
+
+### Vertex deduplication 删除顶点重复数据
+
+不幸的是，我们还没有真正利用索引缓冲区。 `vertices` 矢量包含大量重复的顶点数据，因为多个顶点包含在多个三角形中。我们应该只保留唯一的顶点，并在它们出现时使用索引缓冲区来重用它们。一个简单的实现方法是使用 `map` 或 `unordered_map` 来跟踪唯一的顶点和各自的索引:
+
+```cpp
+#include <unordered_map>
+
+...
+
+std::unordered_map<Vertex, uint32_t> uniqueVertices{};
+
+for (const auto& shape : shapes) {
+    for (const auto& index : shape.mesh.indices) {
+        Vertex vertex{};
+
+        ...
+
+        if (uniqueVertices.count(vertex) == 0) {
+            uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
+            vertices.push_back(vertex);
+        }
+
+        indices.push_back(uniqueVertices[vertex]);
+    }
+}
+```
+
+每当我们从 OBJ 文件中读取一个顶点时，我们检查是否已经看到一个顶点具有完全相同的位置和纹理坐标。如果没有，我们将其添加到顶点，并将其索引存储在 `uniqueVertices` 容器中。然后我们将新顶点的索引添加到索引中。如果我们以前见过完全相同的顶点，那么我们在 `uniqueVertices` 中查找它的索引并将索引存储在索引中。
+
+这个程序现在将无法编译，因为使用用户定义类型(如 Vertex struct)作为哈希表中的键需要我们实现两个函数: 相等性测试和哈希计算。前者通过重载 `Vertex` 结构中的 `==` 操作符很容易实现:
+
+```cpp
+bool operator==(const Vertex& other) const {
+    return pos == other.pos && color == other.color && texCoord == other.texCoord;
+}
+```
+
+通过为 `std::hash<T>` 指定模板专门化，可以实现 `Vertex` 的哈希函数。哈希函数是一个复杂的主题，但是 cppreference.com 建议以下方法结合结构的字段来创建一个高质量的哈希函数:
+
+```cpp
+namespace std {
+    template<> struct hash<Vertex> {
+        size_t operator()(Vertex const& vertex) const {
+            return ((hash<glm::vec3>()(vertex.pos) ^
+                   (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
+                   (hash<glm::vec2>()(vertex.texCoord) << 1);
+        }
+    };
+}
+```
+
+此代码应该放置在 `Vertex` 结构体之外。`GLM` 类型的hash函数需要使用以下头部包含:
+
+```cpp
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/gtx/hash.hpp>
+```
+
+散列函数在 `gtx` 文件夹中定义，这意味着从技术上讲，它仍然是 `GLM` 的实验性扩展。因此，您需要定义 `GLM_ENABLE_EXPERIMENTAL` 来使用它。这意味着这个 API 将来可能会随着 GLM 的新版本而改变，但实际上这个 API 是非常稳定的。
+
+现在您应该能够成功地编译和运行您的程序了。如果你检查顶点的大小，你会看到它已经从1,500,000缩小到265,645！这意味着每个顶点平均重用6个三角形。这绝对节省了我们大量的 GPU 内存。
+
