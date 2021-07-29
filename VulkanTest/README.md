@@ -423,11 +423,11 @@ const std::vector<Vertex> vertices = {
 
 在下一章中，我们将看到一种不同的方式来复制顶点数据到一个顶点缓冲区，这将带来更好的性能，但需要更多的工作。
 
-### Staging buffer 分级缓冲器
+### Staging buffer 暂存缓冲区
 
-#### Introduction 分级缓冲器 引言
+#### Introduction 暂存缓冲区 引言
 
-我们现在使用的顶点缓冲区可以正常工作，但是允许我们从 CPU 访问它的内存类型可能不是显卡本身可以读取的最佳内存类型。最理想的内存具有 `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` 标志，并且通常不能被专用显卡上的CPU访问。在本章中，我们将创建两个顶点缓冲区。CPU 可访问内存中的一个分级缓冲区，用于将顶点数组中的数据上传到设备本地内存中的最终顶点缓冲区。然后，我们将使用一个缓冲区复制命令将数据从分级缓冲器移动到实际的顶点缓冲区。
+我们现在使用的顶点缓冲区可以正常工作，但是允许我们从 CPU 访问它的内存类型可能不是显卡本身可以读取的最佳内存类型。最理想的内存具有 `VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT` 标志，并且通常不能被专用显卡上的CPU访问。在本章中，我们将创建两个顶点缓冲区。CPU 可访问内存中的一个分级缓冲区，用于将顶点数组中的数据上传到设备本地内存中的最终顶点缓冲区。然后，我们将使用一个缓冲区复制命令将数据从暂存缓冲区移动到实际的顶点缓冲区。
 
 #### Transfer queue 转移队列
 
@@ -612,7 +612,7 @@ copyBuffer(stagingBuffer, vertexBuffer, bufferSize);
 
 运行你的程序来验证你是否又看到了熟悉的三角形。这个改进现在可能看不到，但是它的顶点数据现在正在从高性能内存中加载。当我们开始渲染更多的复杂几何图形时，这个问题就变得很重要了。
 
-#### Conclusion 分级缓冲器 总结
+#### Conclusion 暂存缓冲区 总结
 
 需要注意的是，在现实应用程序中，不应该为每个缓冲区实际调用 `vkallocatemory` 。同时内存分配的最大数量受限于 `maxmemorylocationcount` 物理设备限制，即使在高端硬件如 NVIDIA GTX 1080上也可能低至 `4096` 。同时为大量对象分配内存的正确方法是创建一个自定义分配器，该分配器通过使用我们在许多函数中看到的偏移量参数在许多不同对象之间分配单个内存。
 
@@ -3183,3 +3183,351 @@ namespace std {
 
 现在您应该能够成功地编译和运行您的程序了。如果你检查顶点的大小，你会看到它已经从1,500,000缩小到265,645！这意味着每个顶点平均重用6个三角形。这绝对节省了我们大量的 GPU 内存。
 
+## Generating Mipmaps 生成 Mipmaps
+
+### Introduction 生成 Mipmaps 引言
+
+我们的程序现在可以加载和渲染 3D 模型。在本章中，我们将添加另一个特性，生成 mipmap。Mipmaps 广泛应用于游戏和渲染软件，Vulkan 让我们完全控制它们是如何创建的。
+
+Mipmaps 是预先计算的、缩小了的图像版本。每一张新图片的宽度和高度都是前一张的一半。Mipmaps被用作细节级别或LOD的一种形式。远离相机的物体将从较小的mip图像中取样纹理。使用较小的图像可以提高渲染速度，并避免像Moiré模式这样的伪影。mipmaps的一个示例如下:
+
+![img/mipmaps_example](img/mipmaps_example.jpg)
+
+### Image creation 创建图像
+
+在 Vulkan 中，每个 mip 图像都存储在 `VkImage` 的不同 mip 级别中。Mip 级别0是原始图像，级别0之后的 Mip 级别通常称为 Mip 链。
+
+创建 `VkImage` 时指定 mip 级别的数量。到目前为止，我们一直将这个值设置为1。我们需要从图像的维度计算 mip 级别的数量。首先，添加一个类成员来存储这个数字:
+
+```cpp
+...
+uint32_t mipLevels;
+VkImage textureImage;
+...
+```
+
+一旦我们在`createTextureImage`中加载了纹理，就可以计算mipLevels的值:
+
+```cpp
+int texWidth, texHeight, texChannels;
+stbi_uc* pixels = stbi_load(TEXTURE_PATH.c_str(), &texWidth, &texHeight, &texChannels, STBI_rgb_alpha);
+...
+mipLevels = static_cast<uint32_t>(std::floor(std::log2(std::max(texWidth, texHeight)))) + 1;
+```
+
+它计算mip链中的层数。`max`函数选择最大的维度。`log2`函数计算维度能被2除多少次。`floor`函数处理最大维度不是2的幂的情况。添加1，使原始图像具有mip级别。
+
+要使用这个值，我们需要更改 `createImage` 、 `createImageView` 和 `transitionimageayout` 函数，以允许我们指定 mip 级别的数量。向函数中添加一个 `mipLevels` 参数:
+
+```cpp
+void createImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+    ...
+    imageInfo.mipLevels = mipLevels;
+    ...
+}
+...
+VkImageView createImageView(VkImage image, VkFormat format, VkImageAspectFlags aspectFlags, uint32_t mipLevels) {
+    ...
+    viewInfo.subresourceRange.levelCount = mipLevels;
+    ...
+}
+...
+void transitionImageLayout(VkImage image, VkFormat format, VkImageLayout oldLayout, VkImageLayout newLayout, uint32_t mipLevels) {
+    ...
+    barrier.subresourceRange.levelCount = mipLevels;
+    ...
+}
+```
+
+更新所有对这些函数的调用，以使用正确的值:
+
+```cpp
+createImage(swapChainExtent.width, swapChainExtent.height, 1, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+...
+createImage(texWidth, texHeight, mipLevels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+```
+
+```cpp
+swapChainImageViews[i] = createImageView(swapChainImages[i], swapChainImageFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+...
+depthImageView = createImageView(depthImage, depthFormat, VK_IMAGE_ASPECT_DEPTH_BIT, 1);
+...
+textureImageView = createImageView(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_ASPECT_COLOR_BIT, mipLevels);
+```
+
+```cpp
+transitionImageLayout(depthImage, depthFormat, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL, 1);
+...
+transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+```
+
+### Generating Mipmaps生成 Mipmaps
+
+我们的纹理图像现在有多个 mip 级别，但是暂存缓冲区只能用来填充 mip 级别 0。其他级别仍未定义。为了填补这些层次，我们需要从我们拥有的单一层次生成数据。我们将使用 `vkCmdBlitImage` 命令。此命令执行复制、缩放和筛选操作。我们将多次调用这个函数，以便对纹理图像的每个级别进行修改。
+
+`vkCmdBlitImage` 被认为是一个传输操作，因此我们必须通知Vulkan，我们打算使用纹理图像作为传输的源和目标。在 `createTextureImage` 中将 `VK_IMAGE_USAGE_TRANSFER_SRC_BIT` 添加到纹理图像的使用标志中:
+
+```cpp
+...
+createImage(texWidth, texHeight, mipLevels, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+...
+```
+
+与其他图像操作一样，`vkCmdBlitImage`依赖于它所操作的图像的布局。我们可以将整个图像转换为`VK_IMAGE_LAYOUT_GENERAL`，但这很可能会很慢。为了获得最佳性能，源镜像应该在`VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`中，而目标镜像应该在`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`中。Vulkan允许我们独立地转换图像的每一个mip级别。每个 blit 一次只处理两个 mip 级别，因此我们可以在多个blit 命令之间转换到最佳布局。
+
+`transitionImageLayout` 只对整个图像执行布局过渡，因此我们需要编写更多的管道屏障命令。在 `createTextureImage` 中删除现有的过渡到 `VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMA`
+
+```cpp
+...
+transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+    copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+//transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps
+...
+```
+
+这将在`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`中保留纹理图像的每一层。当blit命令从`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`读取完成后，每一层都会转换为`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`。
+
+我们现在要编写生成 mipmaps 的函数:
+
+```cpp
+void generateMipmaps(VkImage image, int32_t texWidth, int32_t texHeight, uint32_t mipLevels) {
+    VkCommandBuffer commandBuffer = beginSingleTimeCommands();
+
+    VkImageMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier.image = image;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier.subresourceRange.baseArrayLayer = 0;
+    barrier.subresourceRange.layerCount = 1;
+    barrier.subresourceRange.levelCount = 1;
+
+    endSingleTimeCommands(commandBuffer);
+}
+```
+
+我们会做几个转换，所以我们会重用这个 `VkImageMemoryBarrier` 。上面设置的字段对于所有屏障都是相同的。`subresourceRange.miplevel` , `oldLayout`, `newLayout`, `srcAccessMask`和`dstAccessMask`将根据每个转换而更改。
+
+```cpp
+int32_t mipWidth = texWidth;
+int32_t mipHeight = texHeight;
+
+for (uint32_t i = 1; i < mipLevels; i++) {
+
+}
+```
+
+这个循环将记录每个`VkCmdBlitImage`命令。注意，循环变量从1开始，而不是0。
+
+```cpp
+barrier.subresourceRange.baseMipLevel = i - 1;
+barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+vkCmdPipelineBarrier(commandBuffer,
+    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+    0, nullptr,
+    0, nullptr,
+    1, &barrier);
+```
+
+首先，我们将`i-1`级转换`为VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`。这个转换将等待`i-1`级被填充，或者从之前的`blit`命令，或者从`vkCmdCopyBufferToImage`。当前的blit命令将等待这个转换。
+
+```cpp
+VkImageBlit blit{};
+blit.srcOffsets[0] = { 0, 0, 0 };
+blit.srcOffsets[1] = { mipWidth, mipHeight, 1 };
+blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+blit.srcSubresource.mipLevel = i - 1;
+blit.srcSubresource.baseArrayLayer = 0;
+blit.srcSubresource.layerCount = 1;
+blit.dstOffsets[0] = { 0, 0, 0 };
+blit.dstOffsets[1] = { mipWidth > 1 ? mipWidth / 2 : 1, mipHeight > 1 ? mipHeight / 2 : 1, 1 };
+blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+blit.dstSubresource.mipLevel = i;
+blit.dstSubresource.baseArrayLayer = 0;
+blit.dstSubresource.layerCount = 1;
+```
+
+接下来，我们指定将在blit操作中使用的区域。源mip级别是`i - 1`，目的mip级别是`i`。`srcOffsets`数组的两个元素决定了数据将从哪个3D区域进行复制。`dstoffset`决定了数据将被位写入的区域。`dstoffset[1]`的X和Y维度被除以2，因为每个mip水平是前一个水平大小的一半。`srcOffsets[1]`和`dstOffsets[1]`的Z维必须为1，因为一个2D图像的深度为1。
+
+```cpp
+vkCmdBlitImage(commandBuffer,
+    image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    1, &blit,
+    VK_FILTER_LINEAR);
+```
+
+现在，我们记录blit命令。注意，`textureImage`同时用于`srcImage`和`dstImage`参数。这是因为我们在同一幅图像的不同层次之间进行了位元分割。源mip层刚刚被转换为`VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`，而目标层仍然在`createTextureImage`中的`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`中。
+
+注意，如果你正在使用专用的传输队列(例如为顶点缓冲区提供支持的传输队列):`vkCmdBlitImage`必须提交给具有图形功能的队列。
+
+最后一个参数允许我们指定要在blit中使用的`VkFilter`。这里我们有与创建`VkSampler`时相同的过滤选项。我们使用`VK_FILTER_LINEAR`来启用插值。
+
+```cpp
+barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+vkCmdPipelineBarrier(commandBuffer,
+    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+    0, nullptr,
+    0, nullptr,
+    1, &barrier);
+```
+
+这个屏障将mip 等级 `i - 1`转换为`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`。此转换将等待当前blit命令完成。所有的采样操作将等待这个转换完成。
+
+```cpp
+    ...
+    if (mipWidth > 1) mipWidth /= 2;
+    if (mipHeight > 1) mipHeight /= 2;
+}
+```
+
+在循环结束时，我们将当前 mip 维数除以2。我们在划分之前检查每个尺寸，以确保尺寸永远不会变成0。这可以处理图像不是正方形的情况，因为其中一个 mip 维度会先于另一个维度达到1。当这种情况发生时，对于所有剩余的级别，该维度应该保持为1。
+
+```cpp
+    barrier.subresourceRange.baseMipLevel = mipLevels - 1;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer,
+        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
+        0, nullptr,
+        0, nullptr,
+        1, &barrier);
+
+    endSingleTimeCommands(commandBuffer);
+}
+```
+
+在结束命令缓冲区之前，我们再插入一个管道屏障。这个屏障将最后一个mip级别从`VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL`转换到`VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL`。这不是由循环处理的，因为最后的mip级别从未被Blit处理过。
+
+最后，在 `createTextureImage` 中添加对 `generateipmaps` 的调用:
+
+```cpp
+transitionImageLayout(textureImage, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, mipLevels);
+    copyBufferToImage(stagingBuffer, textureImage, static_cast<uint32_t>(texWidth), static_cast<uint32_t>(texHeight));
+//transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps
+...
+generateMipmaps(textureImage, texWidth, texHeight, mipLevels);
+```
+
+现在我们已经完全填充了纹理图像的 mipmap 了。
+
+### Linear filtering support 线性过滤支持
+
+使用像`vkCmdBlitImage`这样的内置函数来生成所有mip级别是非常方便的，但不幸的是，并不能保证在所有平台上都支持它。它需要我们使用的纹理图像格式支持线性过滤，这可以通过`vkGetPhysicalDeviceFormatProperties`函数进行检查。为此，我们将在`generateMipmaps`函数中添加一个检查。
+
+首先添加一个额外的参数来指定图像格式:
+
+```cpp
+void createTextureImage() {
+    ...
+
+    generateMipmaps(textureImage, VK_FORMAT_R8G8B8A8_SRGB, texWidth, texHeight, mipLevels);
+}
+
+void generateMipmaps(VkImage image, VkFormat imageFormat, int32_t texWidth, int32_t texHeight, uint32_t mipLevels) {
+
+    ...
+}
+```
+
+在 `generateipmaps` 函数中，使用 `vkGetPhysicalDeviceFormatProperties` 请求纹理图像格式的属性:
+
+```cpp
+void generateMipmaps(VkImage image, VkFormat imageFormat, int32_t texWidth, int32_t texHeight, uint32_t mipLevels) {
+
+    // Check if image format supports linear blitting
+    VkFormatProperties formatProperties;
+    vkGetPhysicalDeviceFormatProperties(physicalDevice, imageFormat, &formatProperties);
+
+    ...
+```
+
+`VkFormatProperties`结构体有三个字段，分别是`linearTilingFeatures`、`optimalTilingFeatures`和`bufferFeatures`，它们分别描述了如何根据使用的方式来使用格式。我们创建了一个具有最佳拼贴格式的纹理图像，因此我们需要检查`optimalTilingFeatures`。对线性过滤特性的支持可以通过`VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT`来检查:
+
+```cpp
+if (!(formatProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT)) {
+    throw std::runtime_error("texture image format does not support linear blitting!");
+}
+```
+
+在这种情况下有两种选择。您可以实现一个函数，搜索常见的纹理图像格式，找到一个支持线性渲染的纹理，或者您可以在软件中使用类似于 [stb_image_resize](https://github.com/nothings/stb/blob/master/stb_image_resize.h) 的库来实现 mipmap 生成。然后，可以像加载原始图像那样将每个 mip 级别加载到图像中。
+
+应该注意的是，在运行时生成mipmap级别在实践中并不常见。通常它们是预先生成并存储在纹理文件中与基础等级一起，以提高加载速度。实现软件的大小调整以及从文件中加载多个级别都留给读者作为练习。
+
+### Sampler
+
+当 `VkImage` 保存 mipmap 数据时， `VkSampler` 控制在渲染时如何读取数据。Vulkan 允许我们指定 `minLod`、 `maxLod`、 `mipLodBias` 和 `mipmapMode` (“Lod”表示“细节级别”)。当取样纹理时，取样器根据下列伪代码选择 mip 级别:
+
+```cpp
+lod = getLodLevelFromScreenSize(); //smaller when the object is close, may be negative
+lod = clamp(lod + mipLodBias, minLod, maxLod);
+
+level = clamp(floor(lod), 0, texture.mipLevels - 1);  //clamped to the number of mip levels in the texture
+
+if (mipmapMode == VK_SAMPLER_MIPMAP_MODE_NEAREST) {
+    color = sample(level);
+} else {
+    color = blend(sample(level), sample(level + 1));
+}
+```
+
+如果`samplerInfo.mipmapMode`是`VK_SAMPLER_MIPMAP_MODE_NEAREST`, lod选择采样的mip级别。当mipmap模式为`VK_SAMPLER_MIPMAP_MODE_LINEAR`时，使用lod选择两个mip级别进行采样。对这些级别进行采样，并将结果线性混合。
+
+取样操作同样受到`lod`的影响
+
+```cpp
+if (lod <= 0) {
+    color = readTexture(uv, magFilter);
+} else {
+    color = readTexture(uv, minFilter);
+}
+```
+
+如果对象靠近摄像机，则使用 `magFilter` 作为过滤器。如果对象距离相机较远，则使用 `minFilter` 。通常，`lod` 是非负的，当关闭相机时，lod 只能为0。`mipLodBias` 可以让我们迫使 Vulkan 使用比正常使用更低的`lod`和`level`。
+
+为了看到这一章的结果，我们需要为我们的 `textureSampler` 选择值。我们已经将 `minFilter` 和 `magFilter` 设置为使用 `VK_FILTER_LINEAR`。我们只需要为 `minLod`、 `maxLod`、 `mipLodBias` 和 `mipmapMode` 选择值。
+
+```cpp
+void createTextureSampler() {
+    ...
+    samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
+    samplerInfo.minLod = 0.0f; // Optional
+    samplerInfo.maxLod = static_cast<float>(mipLevels);
+    samplerInfo.mipLodBias = 0.0f; // Optional
+    ...
+}
+```
+
+为了允许使用整个 mip 级别范围，我们将 `minLod` 设置为`0.0f`，将 `maxLod` 设置为 `mip` 级别的数量。我们没有理由更改 `lod` 值，因此我们将 `mipLodBias` 设置为`0.0f`。
+
+现在运行你的程序，你应该会看到以下内容:
+
+![mipmaps_example](img/mipmaps.png)
+
+这不是一个戏剧性的区别，因为我们的场景是如此简单，如果你仔细观察就会发现其中的细微差别。
+
+![mipmaps_comparison](img/mipmaps_comparison.png)
+
+最明显的区别是纸上的文字。有了mipmaps，文字变得更加平滑。没有mipmaps，这些文字就会有粗糙的边缘和 Moiré 留下的缝隙。
+
+您可以尝试使用采样器设置，看看它们是如何影响 mipmapping 的。例如，通过更改 `minLod` ，可以强制取样器不使用最低 mip 水平:
+
+```cpp
+samplerInfo.minLod = static_cast<float>(mipLevels / 2);
+```
+
+![highmipmaps](img/highmipmaps.png)
+
+当物体离相机较远时，就会使用更高的mip级别。
