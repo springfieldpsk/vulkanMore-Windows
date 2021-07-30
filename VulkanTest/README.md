@@ -3751,3 +3751,51 @@ void createGraphicsPipeline() {
 
 现在运行你的程序，你应该会看到以下内容:
 
+![multisampling](img/multisampling.png)
+
+就像 mipmapping 一样，这种差异可能不会马上显现出来。仔细观察，你会发现边缘不再像原来那样锯齿状了，整个图像看起来比原来更平滑了。
+
+![multisampling_comparison](img/multisampling_comparison.png)
+
+当近距离观察其中一个边缘时，这种差异更加明显:
+
+![multisampling_comparison2](img/multisampling_comparison2.png)
+
+### Quality improvements 质量改进
+
+目前的MSAA实现存在一定的局限性，可能会影响更详细场景的输出图像质量。例如，我们目前还没有解决由着色器混叠引起的潜在问题，即MSAA只平滑几何的边缘，但是不会填充内部。这可能会导致一种情况，当你将一个平滑的多边形渲染在屏幕上，但应用的纹理仍然看起来会存在锯齿，如果它包含高对比色。解决这个问题的一种方法是启用Sample Shading，这将进一步提高图像质量，尽管会增加性能成本:
+
+```cpp
+
+void createLogicalDevice() {
+    ...
+    deviceFeatures.sampleRateShading = VK_TRUE; // enable sample shading feature for the device
+    ...
+}
+
+void createGraphicsPipeline() {
+    ...
+    multisampling.sampleShadingEnable = VK_TRUE; // enable sample shading in the pipeline
+    multisampling.minSampleShading = .2f; // min fraction for sample shading; closer to one is smoother
+    ...
+}
+```
+
+在这个例子中，我们将禁用样例阴影，但在某些情况下，质量改进可能是显而易见的:
+
+![sample_shading](img/sample_shading.png)
+
+### Conclusion  总结
+
+我们做了很多工作才做到这一点，但现在我们终于有了一个很好的Vulkan项目的基础。你现在掌握的Vulkan的基本原理知识应该足以开始探索更多的功能，比如:
+
+- Push constants 推送常量
+- Instanced rendering 实例渲染
+- Dynamic uniforms 动态uniforms
+- Separate images and sampler descriptors 单独的图像和采样描述符
+- Pipeline cache 管道缓存
+- Multi-threaded command buffer generation 多线程命令缓冲区
+- Multiple subpasses 多个子通道
+- Compute shaders 计算着色器
+  
+当前的程序可以通过多种方式进行扩展，如添加 Blinn-Phong 灯光、后处理效果和阴影映射。您应该能够从其他 api 的教程中了解这些特效是如何工作的，因为尽管 Vulkan 有一定的特点，但许多概念仍然是一样的。
