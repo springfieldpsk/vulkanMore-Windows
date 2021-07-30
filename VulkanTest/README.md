@@ -3531,3 +3531,223 @@ samplerInfo.minLod = static_cast<float>(mipLevels / 2);
 ![highmipmaps](img/highmipmaps.png)
 
 当物体离相机较远时，就会使用更高的mip级别。
+
+## Multisampling 多重采样
+
+### Introduction 多重采样引言
+
+我们的程序现在可以加载纹理的多层细节，当渲染对象远离查看器时会修复伪影。图像现在平滑了很多，但是仔细观察你会发现沿着几何形状的边缘有锯齿状的图案。这在我们早期的一个程序中尤其明显，当我们渲染一个四边形时
+
+![texcoord_visualization](img/texcoord_visualization.png)
+
+这种不希望出现的效果被称为“锯齿”，这是由于可用于渲染的像素数量有限造成的。因为没有无限分辨率的显示器，所以在某种程度上它总是可见的。有很多方法可以解决这个问题，在这一章中，我们将集中讨论其中一个比较流行的方法: [MSAA](https://en.wikipedia.org/wiki/Multisample_anti-aliasing) 多重采样抗锯齿。
+
+在普通渲染中，像素颜色是基于单个采样点确定的，在大多数情况下，这个采样点是屏幕上目标像素的中心。如果部分绘制的直线通过某个像素但没有覆盖采样点，则该像素将保留空白，从而导致锯齿状的“楼梯”效应。
+
+![aliasing](img/aliasing.png)
+
+MSAA 所做的是每个像素使用多个采样点(因此得名)来确定其最终颜色。正如人们可能预期的那样，更多的样本导致更好的结果，然而它计算所需要的成本也就更高。
+
+![antialiasing](img/antialiasing.png)
+
+在我们的实现中，我们将关注于使用最大可用的样本数。根据您的应用程序，这可能并不总是最好的方法，如果最终结果满足您的质量要求，为了提高性能，最好使用较少的采样点。
+
+### Getting available sample count 获取可用的采样点数量
+
+让我们首先确定我们的硬件可以使用多少个采样点。大多数现代 gpu 支持至少8个采样点，但这个数字并不能保证在所有地方都是一样的。我们将通过添加一个新的类成员来跟踪它:
+
+```cpp
+...
+VkSampleCountFlagBits msaaSamples = VK_SAMPLE_COUNT_1_BIT;
+...
+```
+
+默认情况下，每个像素只使用一个采样点，这相当于没有多重采样，在这种情况下，最终的图像将保持不变。可以从 `VkPhysicalDeviceProperties` 获取我们选定的物理设备的精确的最大数量的采样点。我们使用了深度缓冲器，所以我们必须考虑颜色和深度的样本数量。两者都支持的最大样本数(&)将是我们能够支持的最大值。添加一个函数来获取这些信息:
+
+```cpp
+VkSampleCountFlagBits getMaxUsableSampleCount() {
+    VkPhysicalDeviceProperties physicalDeviceProperties;
+    vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+
+    VkSampleCountFlags counts = physicalDeviceProperties.limits.framebufferColorSampleCounts & physicalDeviceProperties.limits.framebufferDepthSampleCounts;
+    if (counts & VK_SAMPLE_COUNT_64_BIT) { return VK_SAMPLE_COUNT_64_BIT; }
+    if (counts & VK_SAMPLE_COUNT_32_BIT) { return VK_SAMPLE_COUNT_32_BIT; }
+    if (counts & VK_SAMPLE_COUNT_16_BIT) { return VK_SAMPLE_COUNT_16_BIT; }
+    if (counts & VK_SAMPLE_COUNT_8_BIT) { return VK_SAMPLE_COUNT_8_BIT; }
+    if (counts & VK_SAMPLE_COUNT_4_BIT) { return VK_SAMPLE_COUNT_4_BIT; }
+    if (counts & VK_SAMPLE_COUNT_2_BIT) { return VK_SAMPLE_COUNT_2_BIT; }
+
+    return VK_SAMPLE_COUNT_1_BIT;
+}
+```
+
+现在，我们将使用此函数在物理设备选择过程中设置 `msaaSamples` 变量。为此，我们需要稍微修改 `pickPhysicalDevice` 函数:
+
+### Setting up a render target 设置渲染目标
+
+在 MSAA 中，每个像素在一个离屏缓冲区中取样，然后渲染到屏幕上。这个新的缓冲区与我们渲染的普通图像略有不同——它们必须能够存储每个像素的多个样本。一旦创建了多采样缓冲区，就必须将其解析为默认帧缓冲区(每个像素只存储一个样本)。这就是为什么我们必须创建一个额外的渲染目标和修改我们当前的绘图过程。我们只需要一个渲染目标，同一时间只会有一个绘制操作，就像深度缓冲区一样。添加以下类成员:
+
+```cpp
+...
+VkImage colorImage;
+VkDeviceMemory colorImageMemory;
+VkImageView colorImageView;
+...
+```
+
+这个新图像将必须存储每个像素所需的样本数量，因此我们需要在图像创建过程中将这个数量传递给 `VkImageCreateInfo` 。通过添加 `numSamples` 参数来修改 `createImage` 函数:
+
+```cpp
+void createImage(uint32_t width, uint32_t height, uint32_t mipLevels, VkSampleCountFlagBits numSamples, VkFormat format, VkImageTiling tiling, VkImageUsageFlags usage, VkMemoryPropertyFlags properties, VkImage& image, VkDeviceMemory& imageMemory) {
+    ...
+    imageInfo.samples = numSamples;
+    ...
+```
+
+现在，使用`VK_SAMPLE_COUNT_1_BIT`更新对该函数的所有调用——我们将在实现过程中用适当的值替换它:
+
+```cpp
+createImage(swapChainExtent.width, swapChainExtent.height, 1, VK_SAMPLE_COUNT_1_BIT, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+...
+createImage(texWidth, texHeight, mipLevels, VK_SAMPLE_COUNT_1_BIT, VK_FORMAT_R8G8B8A8_SRGB, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, textureImage, textureImageMemory);
+```
+
+我们现在将创建一个多取样的颜色缓冲区。添加一个 `createColorResources` 函数，并注意我们在这里使用了 `msaaSamples` 作为创建 `image` 的函数参数。我们也只使用一个 mip 级别，因为 Vulkan 规范在每个像素有一个以上采样的图像的情况下强制使用这个级别。此外，这个颜色缓冲区不需要 mipmaps，因为它不会用作纹理:
+
+```cpp
+void createColorResources() {
+    VkFormat colorFormat = swapChainImageFormat;
+
+    createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, colorFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, colorImage, colorImageMemory);
+    colorImageView = createImageView(colorImage, colorFormat, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+}
+```
+
+为了保持一致性，在 `createDepthResources` 之前调用这个函数:
+
+```cpp
+void initVulkan() {
+    ...
+    createColorResources();
+    createDepthResources();
+    ...
+}
+``
+
+现在我们已经有了一个多采样的颜色缓冲区，是时候考虑深度了。修改 `createDepthResources` 并更新深度缓冲区使用的样本数:
+
+```cpp
+void createDepthResources() {
+    ...
+    createImage(swapChainExtent.width, swapChainExtent.height, 1, msaaSamples, depthFormat, VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, depthImage, depthImageMemory);
+    ...
+}
+```
+
+我们现在已经创建了两个新的 Vulkan 资源，所以让我们不要忘记在必要时释放它们:
+
+```cpp
+void cleanupSwapChain() {
+    vkDestroyImageView(device, colorImageView, nullptr);
+    vkDestroyImage(device, colorImage, nullptr);
+    vkFreeMemory(device, colorImageMemory, nullptr);
+    ...
+}
+```
+
+并更新 `recreateSwapChain` ，以便在调整窗口大小时以正确的分辨率重新创建新的彩色图像:
+
+```cpp
+void recreateSwapChain() {
+    ...
+    createGraphicsPipeline();
+    createColorResources();
+    createDepthResources();
+    ...
+}
+```
+
+我们已经通过了最初的 MSAA 设置，现在我们需要开始在我们的绘图管线、帧缓冲区、渲染通道中使用这个新的资源并最后查看结果
+
+### Adding new attachments 添加新的附件
+
+让我们首先处理渲染通道，修改 `createRenderPass` 并更新颜色和深度附件创建信息结构:
+
+```cpp
+void createRenderPass() {
+    ...
+    colorAttachment.samples = msaaSamples;
+    colorAttachment.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ...
+    depthAttachment.samples = msaaSamples;
+    ...
+```
+
+你会注意到我们已经将`finalLayout`从`VK_IMAGE_LAYOUT_PRESENT_SRC_KHR`更改为`VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL`。这是因为多采样图像不能直接渲染。我们首先需要将它们分解成常规图像。这个要求不适用于深度缓冲区，因为它在任何时候都不会显示。因此，我们将不得不添加一个新的颜色附件，这是一个所谓的 resolve attachment:
+
+```cpp
+    ...
+    VkAttachmentDescription colorAttachmentResolve{};
+    colorAttachmentResolve.format = swapChainImageFormat;
+    colorAttachmentResolve.samples = VK_SAMPLE_COUNT_1_BIT;
+    colorAttachmentResolve.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachmentResolve.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    colorAttachmentResolve.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    colorAttachmentResolve.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    colorAttachmentResolve.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    colorAttachmentResolve.finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    ...
+```
+
+现在必须指示渲染通道将多采样的彩色图像分解为规则的附件。创建一个新的附件引用，它将指向作为解析目标的颜色缓冲区:
+
+```cpp
+    ...
+    VkAttachmentReference colorAttachmentResolveRef{};
+    colorAttachmentResolveRef.attachment = 2;
+    colorAttachmentResolveRef.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    ...
+```
+
+将 `pResolveAttachments` 子通道结构成员设置为指向新创建的附件引用。这就足够让渲染通道定义一个多采样解析操作，让我们将图像渲染到屏幕:
+
+```cpp
+    ...
+    subpass.pResolveAttachments = &colorAttachmentResolveRef;
+    ...
+```
+
+现在用新的颜色附件更新渲染通道信息结构:
+
+```cpp
+    ...
+    std::array<VkAttachmentDescription, 3> attachments = {colorAttachment, depthAttachment, colorAttachmentResolve};
+    ...
+```
+
+在渲染通道就位后，修改 `createFrameBuffers` 并将新的图像视图添加到列表中:
+
+```cpp
+void createFrameBuffers() {
+        ...
+        std::array<VkImageView, 3> attachments = {
+            colorImageView,
+            depthImageView,
+            swapChainImageViews[i]
+        };
+        ...
+}
+```
+
+最后，通过修改 `createGraphicsPipeline`，告诉新创建的管道使用多个示例:
+
+```cpp
+void createGraphicsPipeline() {
+    ...
+    multisampling.rasterizationSamples = msaaSamples;
+    ...
+}
+```
+
+现在运行你的程序，你应该会看到以下内容:
+
